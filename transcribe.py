@@ -1,13 +1,23 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "google-genai>=1.65.0",
+#     "rich>=14.0.0",
+# ]
+# ///
 """
-transcribe - Terminal app for audio transcription with speaker detection.
+transcribe — Terminal app for audio transcription with speaker detection.
 
-Run:  uv run python transcribe.py
+Usage:
+  uv run transcribe.py              # interactive
+  uv run transcribe.py recording.mp3
 """
 
 import json
 import math
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -37,34 +47,60 @@ try:
         TextColumn,
     )
     from rich.prompt import Prompt
+    from rich.rule import Rule
     from rich.table import Table
     from rich.text import Text
 except ImportError:
     _need.append("rich")
 if _need:
     print(f"Missing: {', '.join(_need)}")
-    print(f"Run:  pip install {' '.join(_need)}")
+    print("Run:  uv run transcribe.py  (auto-installs dependencies)")
     sys.exit(1)
-for bin in ("ffmpeg", "ffprobe"):
-    if not shutil.which(bin):
-        print(f"{bin} is required:")
-        print("  macOS:   brew install ffmpeg")
-        print("  Linux:   sudo apt install ffmpeg")
+
+for _bin in ("ffmpeg", "ffprobe"):
+    if not shutil.which(_bin):
+        print(f"\n  {_bin} is required but not found.\n")
+        if sys.platform == "darwin":
+            print("  Install:  brew install ffmpeg")
+        elif sys.platform == "win32":
+            print("  Install:  winget install ffmpeg")
+            print("       or:  choco install ffmpeg")
+        else:
+            print("  Install:  sudo apt install ffmpeg")
+        print()
         sys.exit(1)
 
 # ── Config ────────────────────────────────────────────────────────────
 
-MAX_CHUNK_S = 10 * 60  # 10 minutes in seconds
+VERSION = "0.2.0"
+MAX_CHUNK_S = 10 * 60  # 10 minutes
 
 MODELS = {
-    "1": ("gemini-3-flash-preview", "Gemini 3 Flash Preview  [dim](latest, recommended)[/]"),
-    "2": ("gemini-2.5-flash-preview-04-17", "Gemini 2.5 Flash        [dim](stable)[/]"),
+    "1": ("gemini-3-flash-preview", "Gemini 3 Flash  [dim](recommended)[/]"),
+    "2": ("gemini-2.5-flash-preview-04-17", "Gemini 2.5 Flash  [dim](stable)[/]"),
 }
-DEFAULT_MODEL = "gemini-3-flash-preview"
+
+TOTAL_STEPS = 7
 
 # ── Console ───────────────────────────────────────────────────────────
 
 C = Console()
+
+# ── UI Helpers ────────────────────────────────────────────────────────
+
+
+def step_header(num, label):
+    """Print a styled step divider."""
+    C.print()
+    C.print(
+        Rule(
+            f"[bold bright_blue] {num}/{TOTAL_STEPS} [/]  [dim]{label}[/]",
+            style="bright_blue",
+            align="left",
+        )
+    )
+    C.print()
+
 
 # ── Audio helpers (ffmpeg) ────────────────────────────────────────────
 
@@ -96,7 +132,6 @@ def split_audio(path, chunk_s, outdir):
 
     total_parts = math.ceil(duration / chunk_s)
 
-    C.print()
     parts = []
     with Progress(
         SpinnerColumn(style="bright_blue"),
@@ -126,12 +161,12 @@ def split_audio(path, chunk_s, outdir):
             idx += 1
             prog.advance(task)
 
-    C.print(f"  [green]>[/] Split into    [bold]{len(parts)}[/] parts [dim](10 min each)[/]")
+    C.print(f"  [green]✓[/] Split into [bold]{len(parts)}[/] parts [dim](10 min each)[/]")
     return parts, duration
 
 
 def play_audio_clip(filepath, start_seconds, duration=8):
-    """Extract a clip and play it. Returns the Popen process."""
+    """Extract a clip and play it. Returns (Popen process, tmp_path)."""
     tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     tmp.close()
     subprocess.run(
@@ -144,10 +179,24 @@ def play_audio_clip(filepath, start_seconds, duration=8):
         ],
         capture_output=True,
     )
-    # Try afplay (macOS), then ffplay, then aplay
-    for cmd in (["afplay", tmp.name], ["ffplay", "-nodisp", "-autoexit", tmp.name]):
+
+    # Platform-specific player, then cross-platform ffplay
+    if sys.platform == "darwin":
+        players = [["afplay", tmp.name]]
+    elif sys.platform == "win32":
+        players = [
+            ["powershell", "-c",
+             f"(New-Object Media.SoundPlayer '{tmp.name}').PlaySync()"],
+        ]
+    else:
+        players = []
+    players.append(["ffplay", "-nodisp", "-autoexit", tmp.name])
+
+    for cmd in players:
         if shutil.which(cmd[0]):
-            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
             return proc, tmp.name
     return None, tmp.name
 
@@ -177,6 +226,15 @@ def fmt_ts(seconds):
     return f"[{seconds // 60:02d}:{seconds % 60:02d}]"
 
 
+def fmt_srt_ts(seconds):
+    """Format seconds as HH:MM:SS,000 for SRT."""
+    seconds = max(0, int(seconds))
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    return f"{h:02d}:{m:02d}:{s:02d},000"
+
+
 def offset_timestamps(text, offset_seconds):
     """Add offset_seconds to all [MM:SS] or [H:MM:SS] timestamps in text."""
     if offset_seconds == 0:
@@ -204,20 +262,67 @@ def get_speaker_timestamp(text, speaker):
     return None
 
 
+def transcript_to_srt(text):
+    """Convert timestamped transcript to SRT subtitle format."""
+    lines = text.strip().split("\n")
+    entries = []
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        m = re.match(r"\[(\d{1,2}:\d{2}(?::\d{2})?)\]\s*(.*)", line)
+        if m:
+            ts_seconds = parse_ts(m.group(1))
+            content = m.group(2).strip()
+            if content:
+                entries.append((ts_seconds, content))
+
+    if not entries:
+        return text
+
+    srt_parts = []
+    for i, (start, content) in enumerate(entries):
+        if i + 1 < len(entries):
+            end = entries[i + 1][0]
+        else:
+            words = len(content.split())
+            end = start + max(3, min(words // 2, 10))
+
+        srt_parts.append(str(i + 1))
+        srt_parts.append(f"{fmt_srt_ts(start)} --> {fmt_srt_ts(end)}")
+        srt_parts.append(content)
+        srt_parts.append("")
+
+    return "\n".join(srt_parts)
+
+
 # ── Secure key storage ────────────────────────────────────────────────
 
 KEYCHAIN_SERVICE = "transcribe-cli"
 KEYCHAIN_ACCOUNT = "gemini-api-key"
 
 
-def _is_macos():
-    return sys.platform == "darwin"
+def _key_file_path():
+    """Get the key file path for Linux/Windows."""
+    if sys.platform == "win32":
+        base = Path(os.environ.get("APPDATA", str(Path.home())))
+    else:
+        base = Path.home() / ".config"
+    return base / "transcribe" / "key"
+
+
+def _key_store_name():
+    if sys.platform == "darwin":
+        return "Keychain"
+    elif sys.platform == "win32":
+        return "AppData"
+    return "config"
 
 
 def save_api_key(key):
-    """Save API key to macOS Keychain or fallback config file."""
-    if _is_macos():
-        # Delete old entry if exists (ignore errors)
+    """Save API key securely."""
+    if sys.platform == "darwin":
         subprocess.run(
             ["security", "delete-generic-password",
              "-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT],
@@ -231,18 +336,17 @@ def save_api_key(key):
         )
         return r.returncode == 0
     else:
-        # Linux/other: store in ~/.config/transcribe/key (chmod 600)
-        cfg = Path.home() / ".config" / "transcribe"
-        cfg.mkdir(parents=True, exist_ok=True)
-        kf = cfg / "key"
+        kf = _key_file_path()
+        kf.parent.mkdir(parents=True, exist_ok=True)
         kf.write_text(key, encoding="utf-8")
-        kf.chmod(0o600)
+        if sys.platform != "win32":
+            kf.chmod(0o600)
         return True
 
 
 def load_api_key():
-    """Load API key from macOS Keychain or fallback config file."""
-    if _is_macos():
+    """Load saved API key."""
+    if sys.platform == "darwin":
         r = subprocess.run(
             ["security", "find-generic-password",
              "-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT, "-w"],
@@ -251,7 +355,7 @@ def load_api_key():
         if r.returncode == 0 and r.stdout.strip():
             return r.stdout.strip()
     else:
-        kf = Path.home() / ".config" / "transcribe" / "key"
+        kf = _key_file_path()
         if kf.exists():
             return kf.read_text(encoding="utf-8").strip()
     return None
@@ -259,14 +363,14 @@ def load_api_key():
 
 def delete_api_key():
     """Remove saved API key."""
-    if _is_macos():
+    if sys.platform == "darwin":
         subprocess.run(
             ["security", "delete-generic-password",
              "-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT],
             capture_output=True,
         )
     else:
-        kf = Path.home() / ".config" / "transcribe" / "key"
+        kf = _key_file_path()
         if kf.exists():
             kf.unlink()
 
@@ -276,48 +380,50 @@ def delete_api_key():
 
 def show_header():
     title = Text(justify="center")
+    title.append("\n")
     title.append("T R A N S C R I B E\n", style="bold bright_white")
-    title.append("audio to text  ·  speaker detection  ·  gemini", style="dim")
-    C.print()
-    C.print(Panel(title, border_style="bright_blue", padding=(1, 2)))
-    C.print()
+    title.append("audio to text  ·  speaker detection  ·  gemini\n", style="dim")
+    title.append(f"v{VERSION}", style="dim italic")
+    C.print(Panel(
+        title,
+        border_style="bright_blue",
+        padding=(1, 4),
+        box=box.DOUBLE,
+    ))
 
 
 def step_api_key(arg_key):
-    # 1. CLI argument
+    step_header(1, "API Key")
+
     if arg_key:
-        C.print("  [green]>[/] API key      provided via flag")
+        C.print("  [green]✓[/] API key provided via flag")
         return arg_key
 
-    # 2. Environment variable
     env_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if env_key:
-        C.print("  [green]>[/] API key      loaded from environment")
+        C.print("  [green]✓[/] API key loaded from environment")
         return env_key
 
-    # 3. Saved key (Keychain on macOS, config file on Linux)
     saved = load_api_key()
     if saved:
-        where = "Keychain" if _is_macos() else "config"
-        C.print(f"  [green]>[/] API key      loaded from {where}")
+        C.print(f"  [green]✓[/] API key loaded from {_key_store_name()}")
         return saved
 
-    # 4. Prompt and offer to save
     C.print("  [dim]Paste your Gemini API key (input is hidden):[/]")
-    key = Prompt.ask("  [bright_blue]>[/] API key     ", password=True)
+    key = Prompt.ask("  [bright_blue]>[/] API key", password=True)
     if not key.strip():
         C.print("  [red]No key provided. Exiting.[/]")
         sys.exit(1)
     key = key.strip()
 
-    where = "Keychain" if _is_macos() else "~/.config/transcribe/"
+    where = _key_store_name()
     save = Prompt.ask(
         f"  [dim]Save to {where} for next time?[/] [bright_blue]Y[/]/n",
         default="y", show_default=False,
     )
     if save.strip().lower() in ("y", "yes", ""):
         if save_api_key(key):
-            C.print(f"  [green]>[/] API key      saved to {where}")
+            C.print(f"  [green]✓[/] API key saved to {where}")
         else:
             C.print("  [yellow]Could not save key[/]")
 
@@ -325,34 +431,39 @@ def step_api_key(arg_key):
 
 
 def step_model(arg_model):
+    step_header(2, "Model")
+
     if arg_model:
-        C.print(f"  [green]>[/] Model         [bold]{arg_model}[/]")
+        C.print(f"  [green]✓[/] Using [bold]{arg_model}[/]")
         return arg_model
-    C.print()
+
     C.print("  [dim]Select a model:[/]")
-    for key, (model_id, label) in MODELS.items():
+    C.print()
+    for key, (_, label) in MODELS.items():
         C.print(f"    [bright_blue]{key}[/]  {label}")
+    C.print()
     choice = Prompt.ask(
-        "  [bright_blue]>[/] Model        ",
+        "  [bright_blue]>[/] Model",
         default="1", show_default=False,
     )
     model_id = MODELS.get(choice.strip(), (None, None))[0]
     if model_id is None:
         model_id = choice.strip()
-    C.print(f"  [green]>[/] Using         [bold]{model_id}[/]")
+    C.print(f"  [green]✓[/] Using [bold]{model_id}[/]")
     return model_id
 
 
 def step_audio_file(arg_path=None):
+    step_header(3, "Audio File")
+
     if arg_path:
         path = arg_path.strip().strip("'\"")
     else:
-        C.print()
         C.print("  [dim]Enter path or drag & drop the file here:[/]")
-        raw = Prompt.ask("  [bright_blue]>[/] Audio file  ")
+        raw = Prompt.ask("  [bright_blue]>[/] Audio file")
         path = raw.strip().strip("'\"")
 
-    p = Path(path)
+    p = Path(path).resolve()
     if not p.exists():
         C.print(f"  [red]File not found: {path}[/]")
         sys.exit(1)
@@ -365,11 +476,55 @@ def step_audio_file(arg_path=None):
     size_mb = p.stat().st_size / (1024 * 1024)
     m, s = int(duration // 60), int(duration % 60)
     C.print(
-        f"  [green]>[/] Loaded        "
-        f"[bold]{p.name}[/]  "
+        f"  [green]✓[/] Loaded [bold]{p.name}[/]  "
         f"[dim]({m}m {s:02d}s · {size_mb:.1f} MB)[/]"
     )
-    return str(p)
+    return str(p), duration
+
+
+def step_format(args):
+    """Interactive output format selection. Returns format dict."""
+    step_header(6, "Output Format")
+
+    # If CLI flags set, use those
+    if args.timestamps or args.srt:
+        fmt = {"txt": True, "timestamps": args.timestamps, "srt": args.srt}
+        parts = []
+        if args.timestamps:
+            parts.append("text + timestamps")
+        else:
+            parts.append("text")
+        if args.srt:
+            parts.append("SRT")
+        C.print(f"  [green]✓[/] Format: [bold]{' + '.join(parts)}[/]")
+        return fmt
+
+    C.print("  [dim]Select output format:[/]")
+    C.print()
+    C.print("    [bright_blue]1[/]  Plain text                [dim](default)[/]")
+    C.print("    [bright_blue]2[/]  Plain text with timestamps")
+    C.print("    [bright_blue]3[/]  SRT subtitles")
+    C.print("    [bright_blue]4[/]  All formats")
+    C.print()
+    choice = Prompt.ask("  [bright_blue]>[/] Format", default="1", show_default=False)
+
+    fmt = {"txt": True, "timestamps": False, "srt": False}
+    choice = choice.strip()
+    if choice == "2":
+        fmt["timestamps"] = True
+        C.print("  [green]✓[/] Format: [bold]text with timestamps[/]")
+    elif choice == "3":
+        fmt["srt"] = True
+        fmt["txt"] = False
+        C.print("  [green]✓[/] Format: [bold]SRT subtitles[/]")
+    elif choice == "4":
+        fmt["timestamps"] = True
+        fmt["srt"] = True
+        C.print("  [green]✓[/] Format: [bold]all formats[/]")
+    else:
+        C.print("  [green]✓[/] Format: [bold]plain text[/]")
+
+    return fmt
 
 
 # ── Transcription Engine ─────────────────────────────────────────────
@@ -386,6 +541,19 @@ def upload_and_wait(client, filepath):
     return f
 
 
+def _parse_retry_delay(error_str):
+    """Parse the suggested retry delay (seconds) from an API error."""
+    # Match "retryDelay": "47s" or retryDelay: '47.123s'
+    m = re.search(r"retryDelay['\"]?\s*:\s*['\"]?(\d+(?:\.\d+)?)\s*s", error_str)
+    if m:
+        return float(m.group(1))
+    # Match "retry in 47.123456s"
+    m = re.search(r"retry in (\d+(?:\.\d+)?)\s*s", error_str, re.IGNORECASE)
+    if m:
+        return float(m.group(1))
+    return None
+
+
 def gemini_transcribe(client, model, uploaded_file, part_ctx=""):
     prompt = f"""{part_ctx}Transcribe this audio precisely with speaker diarization.
 
@@ -393,12 +561,15 @@ Rules:
 - Start every line with a timestamp in [MM:SS] format relative to the start of this audio
 - Label each distinct speaker consistently: Speaker 1, Speaker 2, etc.
 - Format every line as: [MM:SS] Speaker N: [spoken text]
-- New line on each speaker change
+- New line on each speaker change or after a significant pause
 - Include ALL speech verbatim — do not summarize, skip, or paraphrase
+- Preserve filler words (um, uh, like, you know, etc.)
+- Note significant pauses: [pause] or [long pause]
+- Note non-speech sounds in brackets: [laughter], [applause], [music], [noise], [cough], [crosstalk]
 - Preserve the original language of the audio"""
 
-    # Retry with backoff for rate limits
-    for attempt in range(5):
+    max_retries = 10
+    for attempt in range(max_retries):
         try:
             resp = client.models.generate_content(
                 model=model,
@@ -408,8 +579,23 @@ Rules:
             return resp.text
         except Exception as e:
             err = str(e).lower()
-            if ("429" in err or "resource_exhausted" in err or "rate" in err) and attempt < 4:
-                wait = (2 ** attempt) * 5  # 5s, 10s, 20s, 40s
+            retryable = (
+                "429" in err
+                or "503" in err
+                or "500" in err
+                or "resource_exhausted" in err
+                or "unavailable" in err
+                or "high demand" in err
+                or "internal" in err
+                or "rate" in err
+            )
+            if retryable and attempt < max_retries - 1:
+                # Use the API's suggested delay if available
+                api_delay = _parse_retry_delay(str(e))
+                if api_delay:
+                    wait = api_delay + random.uniform(1, 5)
+                else:
+                    wait = (2 ** attempt) * 5
                 time.sleep(wait)
                 continue
             raise
@@ -423,7 +609,6 @@ def strip_fences(text):
 
 
 def do_transcribe_single(client, model, filepath):
-    C.print()
     with Progress(
         SpinnerColumn(style="bright_blue"),
         TextColumn("[dim]{task.description}[/]"),
@@ -439,16 +624,15 @@ def do_transcribe_single(client, model, filepath):
                 client.files.delete(name=f.name)
             except Exception:
                 pass
-    C.print("  [green]>[/] Transcription  [green]complete[/]")
+    C.print("  [green]✓[/] Transcription complete")
     return strip_fences(text)
 
 
 def do_transcribe_chunked(client, model, chunk_paths):
     """Two-phase parallel pipeline: upload all, then transcribe all."""
     n = len(chunk_paths)
-    C.print()
 
-    # ── Phase 1: Upload ALL files in parallel ─────────────────────
+    # Phase 1: Upload
     uploaded = [None] * n
     upload_errors = []
     with Progress(
@@ -477,9 +661,11 @@ def do_transcribe_chunked(client, model, chunk_paths):
             C.print(f"  [red]! Upload failed for part {idx + 1}: {err}[/]")
 
     ready = [(i, f) for i, f in enumerate(uploaded) if f is not None]
-    C.print(f"  [green]>[/] Uploaded       [bold]{len(ready)}[/]/{n} files")
+    C.print(f"  [green]✓[/] Uploaded [bold]{len(ready)}[/]/{n} files")
 
-    # ── Phase 2: Transcribe ALL in parallel ───────────────────────
+    # Phase 2: Transcribe (limited concurrency to avoid rate limits)
+    max_concurrent = min(len(ready), 5)
+
     def _transcribe_one(idx, ufile):
         ctx = f"(Segment {idx + 1} of {n} of a longer recording.) "
         return idx, gemini_transcribe(client, model, ufile, ctx)
@@ -494,7 +680,7 @@ def do_transcribe_chunked(client, model, chunk_paths):
         console=C,
     ) as prog:
         task = prog.add_task("  Transcribing parts", total=len(ready))
-        with ThreadPoolExecutor(max_workers=len(ready)) as pool:
+        with ThreadPoolExecutor(max_workers=max_concurrent) as pool:
             futs = {
                 pool.submit(_transcribe_one, i, f): i
                 for i, f in ready
@@ -509,7 +695,7 @@ def do_transcribe_chunked(client, model, chunk_paths):
                     results.append((idx, f"[Error in part {idx + 1}: {e}]"))
                 prog.advance(task)
 
-    # ── Cleanup: delete all uploaded files ────────────────────────
+    # Cleanup uploaded files
     for f in uploaded:
         if f is not None:
             try:
@@ -521,7 +707,7 @@ def do_transcribe_chunked(client, model, chunk_paths):
         for idx, err in errors:
             C.print(f"  [red]! Part {idx + 1} failed: {err}[/]")
 
-    # ── Merge with timestamp offsets ─────────────────────────────
+    # Merge with timestamp offsets
     results.sort()
     merged_parts = []
     for idx, text in results:
@@ -529,7 +715,7 @@ def do_transcribe_chunked(client, model, chunk_paths):
         chunk_text = offset_timestamps(chunk_text, idx * MAX_CHUNK_S)
         merged_parts.append(chunk_text)
 
-    C.print(f"  [green]>[/] Transcription  [green]complete[/]")
+    C.print(f"  [green]✓[/] Transcription complete")
     return "\n\n".join(merged_parts)
 
 
@@ -544,7 +730,7 @@ def find_speakers(text):
 
 
 def step_assign_speakers(text, speakers, filepath):
-    C.print()
+    step_header(5, "Speakers")
 
     table = Table(
         box=box.ROUNDED,
@@ -565,22 +751,21 @@ def step_assign_speakers(text, speakers, filepath):
 
     C.print(table)
     C.print()
-    C.print("  [dim]Assign real names  (Enter = keep label, [bold]p[/bold] = play voice sample):[/]")
+    C.print("  [dim]Assign real names  (Enter = keep, [bold]p[/bold] = play voice sample):[/]")
     C.print()
 
     renames = {}
-    active_player = None  # (process, tmp_file)
+    active_player = None
 
     for spk in speakers:
         while True:
             try:
                 name = Prompt.ask(
-                    f"    [bright_blue]{spk}[/] [dim]->[/]",
+                    f"    [bright_blue]{spk}[/] [dim]→[/]",
                     default="", show_default=False,
                 )
             except (EOFError, KeyboardInterrupt):
                 C.print()
-                # Clean up player
                 if active_player:
                     active_player[0].terminate()
                     try:
@@ -613,11 +798,11 @@ def step_assign_speakers(text, speakers, filepath):
                             pass
                 else:
                     C.print("      [yellow]No timestamp found for this speaker[/]")
-                continue  # Re-prompt for actual name
+                continue
             else:
                 if name.strip():
                     renames[spk] = name.strip()
-                break  # Move to next speaker
+                break
 
     # Clean up any lingering player
     if active_player:
@@ -632,12 +817,12 @@ def step_assign_speakers(text, speakers, filepath):
 
     if renames:
         C.print()
-        C.print(f"  [green]>[/] Renamed {len(renames)} speaker(s)")
+        C.print(f"  [green]✓[/] Renamed {len(renames)} speaker(s)")
 
     return text
 
 
-# ── Output ────────────────────────────────────────────────────────────
+# ── Output & Save ────────────────────────────────────────────────────
 
 
 def step_output(text):
@@ -653,27 +838,50 @@ def step_output(text):
     )
 
 
-def step_save(text, filepath):
+def step_save(txt_text, srt_text, filepath, fmt):
+    step_header(7, "Save")
+
+    audio_dir = Path(filepath).parent.resolve()
     stem = Path(filepath).stem
-    default_name = f"transcript_{stem}.txt"
+    save_txt = fmt.get("txt", True)
+    save_srt = fmt.get("srt", False)
 
-    C.print()
-    C.print(f"  [dim]Press Enter to save, or type a different path. Type [bold]n[/bold] to skip.[/]")
-    save = Prompt.ask(
-        "  [bright_blue]>[/] Save to      ",
-        default=default_name, show_default=True,
-    )
+    if save_txt and txt_text:
+        default_txt = str(audio_dir / f"transcript_{stem}.txt")
+        C.print("  [dim]Press Enter to save, type a path, or [bold]n[/bold] to skip.[/]")
+        save = Prompt.ask(
+            "  [bright_blue]>[/] Save text to",
+            default=default_txt, show_default=True,
+        )
+        if save.strip().lower() not in ("n", "no"):
+            path = Path(save.strip().strip("'\"")).resolve()
+            try:
+                path.write_text(txt_text, encoding="utf-8")
+                C.print(f"  [green]✓[/] Saved to [bold]{path}[/]")
+            except Exception as e:
+                C.print(f"  [red]Could not save: {e}[/]")
+        else:
+            C.print("  [dim]Skipped text.[/]")
 
-    if save.strip().lower() in ("n", "no"):
-        C.print("  [dim]Skipped.[/]")
-        return
+    if save_srt and srt_text:
+        default_srt = str(audio_dir / f"transcript_{stem}.srt")
+        C.print()
+        save = Prompt.ask(
+            "  [bright_blue]>[/] Save SRT to ",
+            default=default_srt, show_default=True,
+        )
+        if save.strip().lower() not in ("n", "no"):
+            path = Path(save.strip().strip("'\"")).resolve()
+            try:
+                path.write_text(srt_text, encoding="utf-8")
+                C.print(f"  [green]✓[/] Saved to [bold]{path}[/]")
+            except Exception as e:
+                C.print(f"  [red]Could not save SRT: {e}[/]")
+        else:
+            C.print("  [dim]Skipped SRT.[/]")
 
-    path = save.strip().strip("'\"")
-    try:
-        Path(path).write_text(text, encoding="utf-8")
-        C.print(f"  [green]>[/] Saved to [bold]{path}[/]")
-    except Exception as e:
-        C.print(f"  [red]Could not save: {e}[/]")
+    if not save_txt and not save_srt:
+        C.print("  [dim]Nothing to save.[/]")
 
 
 # ── Main ──────────────────────────────────────────────────────────────
@@ -688,6 +896,7 @@ def main():
     ap.add_argument("-o", "--output", default=None)
     ap.add_argument("-m", "--model", default=None)
     ap.add_argument("-t", "--timestamps", action="store_true")
+    ap.add_argument("--srt", action="store_true")
     ap.add_argument("--no-speakers", action="store_true")
     ap.add_argument("--reset-key", action="store_true")
     ap.add_argument("-h", "--help", action="store_true")
@@ -695,69 +904,105 @@ def main():
 
     if args.reset_key:
         delete_api_key()
-        where = "Keychain" if _is_macos() else "config"
-        C.print(f"  [green]>[/] API key removed from {where}")
+        C.print(f"  [green]✓[/] API key removed from {_key_store_name()}")
         sys.exit(0)
 
     if args.help:
         show_header()
-        C.print("  [bold]Usage:[/]  python transcribe.py [audio_file]")
+        C.print()
+        C.print("  [bold]Usage:[/]  uv run transcribe.py [audio_file]")
         C.print()
         C.print("  [dim]Options:[/]")
-        C.print("    [bright_blue]-k[/]  --api-key      Gemini API key")
-        C.print("    [bright_blue]-o[/]  --output       Save transcript to file")
-        C.print("    [bright_blue]-m[/]  --model        Model name")
-        C.print("    [bright_blue]-t[/]  --timestamps   Include timestamps in output")
-        C.print("    [bright_blue]    --no-speakers[/]  Skip speaker name assignment")
-        C.print("    [bright_blue]    --reset-key[/]    Remove saved API key")
+        C.print("    [bright_blue]-k[/]  --api-key        Gemini API key")
+        C.print("    [bright_blue]-o[/]  --output         Save transcript to file")
+        C.print("    [bright_blue]-m[/]  --model          Model name")
+        C.print("    [bright_blue]-t[/]  --timestamps     Include timestamps in output")
+        C.print("    [bright_blue]    --srt[/]            Save as SRT subtitle file")
+        C.print("    [bright_blue]    --no-speakers[/]    Skip speaker name assignment")
+        C.print("    [bright_blue]    --reset-key[/]      Remove saved API key")
         C.print()
-        C.print("  [dim]Or just run [bold]python transcribe.py[/bold] and follow the prompts.[/]")
+        C.print("  [dim]Just run [bold]uv run transcribe.py[/bold] and follow the prompts.[/]")
         C.print()
         sys.exit(0)
 
     show_header()
 
-    # 1. API key
+    # Step 1: API key
     key = step_api_key(args.api_key)
     client = genai.Client(api_key=key)
 
-    # 2. Model
+    # Step 2: Model
     model = step_model(args.model)
 
-    # 3. Audio file
-    filepath = step_audio_file(args.audio)
+    # Step 3: Audio file
+    filepath, duration = step_audio_file(args.audio)
 
-    # 4. Split if needed + transcribe
+    # Step 4: Transcribe
+    step_header(4, "Transcribe")
+
     with tempfile.TemporaryDirectory() as tmpdir:
-        chunk_paths, duration = split_audio(filepath, MAX_CHUNK_S, tmpdir)
-
+        chunk_paths, _ = split_audio(filepath, MAX_CHUNK_S, tmpdir)
         if chunk_paths is None:
             transcript = do_transcribe_single(client, model, filepath)
         else:
             transcript = do_transcribe_chunked(client, model, chunk_paths)
 
-    # 5. Speaker names (uses timestamped version for audio preview)
+    # Step 5: Speaker names
     speakers = find_speakers(transcript)
     if speakers and not args.no_speakers:
         transcript = step_assign_speakers(transcript, speakers, filepath)
 
-    # 6. Strip timestamps if not requested
-    if not args.timestamps:
-        transcript = strip_timestamps(transcript)
+    # Step 6: Output format
+    fmt = step_format(args)
 
-    # 7. Show transcript
-    step_output(transcript)
+    # Generate outputs
+    srt_text = transcript_to_srt(transcript) if fmt.get("srt") else None
+    show_ts = fmt.get("timestamps") or (fmt.get("srt") and not fmt.get("txt"))
+    display_text = transcript if show_ts else strip_timestamps(transcript)
+    txt_output = transcript if fmt.get("timestamps") else strip_timestamps(transcript)
 
-    # 8. Save
+    # Show transcript
+    step_output(display_text)
+
+    # Step 7: Save
     if args.output:
         try:
-            Path(args.output).write_text(transcript, encoding="utf-8")
-            C.print(f"\n  [green]>[/] Saved to [bold]{args.output}[/]")
+            Path(args.output).write_text(txt_output, encoding="utf-8")
+            C.print(f"\n  [green]✓[/] Saved to [bold]{args.output}[/]")
         except Exception as e:
             C.print(f"\n  [red]Could not save: {e}[/]")
+        if srt_text:
+            srt_path = Path(args.output).with_suffix(".srt")
+            try:
+                srt_path.write_text(srt_text, encoding="utf-8")
+                C.print(f"  [green]✓[/] Saved to [bold]{srt_path}[/]")
+            except Exception as e:
+                C.print(f"  [red]Could not save SRT: {e}[/]")
     else:
-        step_save(transcript, filepath)
+        step_save(txt_output, srt_text, filepath, fmt)
 
+    # Summary footer
+    n_speakers = len(speakers) if speakers else 0
+    m, s = int(duration // 60), int(duration % 60)
+    fmt_parts = []
+    if fmt.get("txt"):
+        if fmt.get("timestamps"):
+            fmt_parts.append("text + timestamps")
+        else:
+            fmt_parts.append("text")
+    if fmt.get("srt"):
+        fmt_parts.append("SRT")
+    if not fmt_parts:
+        fmt_parts.append("text")
+
+    C.print()
+    C.print(Rule(style="dim"))
+    C.print(
+        f"  [green]✓[/] [bold]Done[/]  [dim]·  "
+        f"{n_speakers} speaker{'s' if n_speakers != 1 else ''}  ·  "
+        f"{m}m {s:02d}s audio  ·  "
+        f"{' + '.join(fmt_parts)}[/]"
+    )
     C.print()
 
 
