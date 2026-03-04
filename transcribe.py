@@ -3,17 +3,18 @@
 # requires-python = ">=3.10"
 # dependencies = [
 #     "google-genai>=1.65.0",
-#     "rich>=14.0.0",
+#     "textual>=3.0.0",
 # ]
 # ///
 """
-transcribe — Terminal app for audio transcription with speaker detection.
+transcribe — Terminal GUI for audio transcription with speaker detection.
 
 Usage:
-  uv run transcribe.py              # interactive
+  uv run transcribe.py              # interactive GUI
   uv run transcribe.py recording.mp3
 """
 
+import argparse
 import json
 import math
 import os
@@ -36,22 +37,17 @@ try:
 except ImportError:
     _need.append("google-genai")
 try:
-    from rich import box
-    from rich.console import Console
-    from rich.panel import Panel
-    from rich.progress import (
-        BarColumn,
-        Progress,
-        SpinnerColumn,
-        TaskProgressColumn,
-        TextColumn,
+    from textual import work
+    from textual.app import App, ComposeResult
+    from textual.binding import Binding
+    from textual.containers import Container, Horizontal, VerticalScroll
+    from textual.screen import ModalScreen
+    from textual.widgets import (
+        Button, Footer, Header, Input, Label,
+        ProgressBar, RadioButton, RadioSet, Static, TextArea,
     )
-    from rich.prompt import Prompt
-    from rich.rule import Rule
-    from rich.table import Table
-    from rich.text import Text
 except ImportError:
-    _need.append("rich")
+    _need.append("textual")
 if _need:
     print(f"Missing: {', '.join(_need)}")
     print("Run:  uv run transcribe.py  (auto-installs dependencies)")
@@ -72,37 +68,15 @@ for _bin in ("ffmpeg", "ffprobe"):
 
 # ── Config ────────────────────────────────────────────────────────────
 
-VERSION = "0.2.0"
-MAX_CHUNK_S = 10 * 60  # 10 minutes
+VERSION = "0.3.0"
+MAX_CHUNK_S = 10 * 60
 
-MODELS = {
-    "1": ("gemini-3-flash-preview", "Gemini 3 Flash  [dim](recommended)[/]"),
-    "2": ("gemini-2.5-flash-preview-04-17", "Gemini 2.5 Flash  [dim](stable)[/]"),
-}
+MODELS = [
+    ("gemini-3-flash-preview", "Gemini 3 Flash  (recommended)"),
+    ("gemini-2.5-flash-preview-04-17", "Gemini 2.5 Flash  (stable)"),
+]
 
-TOTAL_STEPS = 7
-
-# ── Console ───────────────────────────────────────────────────────────
-
-C = Console()
-
-# ── UI Helpers ────────────────────────────────────────────────────────
-
-
-def step_header(num, label):
-    """Print a styled step divider."""
-    C.print()
-    C.print(
-        Rule(
-            f"[bold bright_blue] {num}/{TOTAL_STEPS} [/]  [dim]{label}[/]",
-            style="bright_blue",
-            align="left",
-        )
-    )
-    C.print()
-
-
-# ── Audio helpers (ffmpeg) ────────────────────────────────────────────
+# ── Audio helpers ────────────────────────────────────────────────────
 
 
 def probe_audio(path):
@@ -121,47 +95,37 @@ def probe_audio(path):
     return float(info.get("duration", 0))
 
 
-def split_audio(path, chunk_s, outdir):
-    """Split audio file into <=chunk_s second parts. Returns list of paths."""
+def split_audio(path, chunk_s, outdir, on_progress=None):
+    """Split audio into chunks. Calls on_progress(current, total) if provided."""
     duration = probe_audio(path)
     if duration is None or duration <= 0:
-        C.print(f"  [red]Cannot read audio file: {path}[/]")
-        sys.exit(1)
+        return None, 0
     if duration <= chunk_s:
         return None, duration
 
     total_parts = math.ceil(duration / chunk_s)
-
     parts = []
-    with Progress(
-        SpinnerColumn(style="bright_blue"),
-        TextColumn("[dim]{task.description}[/]"),
-        BarColumn(bar_width=30, complete_style="bright_blue", finished_style="green"),
-        TaskProgressColumn(),
-        console=C,
-    ) as prog:
-        task = prog.add_task("  Splitting audio", total=total_parts)
-        start = 0.0
-        idx = 0
-        while start < duration:
-            out = os.path.join(outdir, f"part_{idx:03d}.mp3")
-            subprocess.run(
-                [
-                    "ffmpeg", "-y", "-v", "quiet",
-                    "-i", str(path),
-                    "-ss", str(start),
-                    "-t", str(chunk_s),
-                    "-acodec", "libmp3lame", "-b:a", "128k",
-                    out,
-                ],
-                capture_output=True,
-            )
-            parts.append(out)
-            start += chunk_s
-            idx += 1
-            prog.advance(task)
+    start = 0.0
+    idx = 0
+    while start < duration:
+        out = os.path.join(outdir, f"part_{idx:03d}.mp3")
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-v", "quiet",
+                "-i", str(path),
+                "-ss", str(start),
+                "-t", str(chunk_s),
+                "-acodec", "libmp3lame", "-b:a", "128k",
+                out,
+            ],
+            capture_output=True,
+        )
+        parts.append(out)
+        start += chunk_s
+        idx += 1
+        if on_progress:
+            on_progress(idx, total_parts)
 
-    C.print(f"  [green]✓[/] Split into [bold]{len(parts)}[/] parts [dim](10 min each)[/]")
     return parts, duration
 
 
@@ -180,7 +144,6 @@ def play_audio_clip(filepath, start_seconds, duration=8):
         capture_output=True,
     )
 
-    # Platform-specific player, then cross-platform ffplay
     if sys.platform == "darwin":
         players = [["afplay", tmp.name]]
     elif sys.platform == "win32":
@@ -201,11 +164,10 @@ def play_audio_clip(filepath, start_seconds, duration=8):
     return None, tmp.name
 
 
-# ── Timestamp helpers ─────────────────────────────────────────────────
+# ── Timestamp helpers ────────────────────────────────────────────────
 
 
 def parse_ts(ts_str):
-    """Parse [MM:SS] or [H:MM:SS] to total seconds."""
     ts_str = ts_str.strip("[]")
     parts = ts_str.split(":")
     if len(parts) == 2:
@@ -216,7 +178,6 @@ def parse_ts(ts_str):
 
 
 def fmt_ts(seconds):
-    """Format seconds as [MM:SS] or [H:MM:SS]."""
     seconds = max(0, int(seconds))
     if seconds >= 3600:
         h = seconds // 3600
@@ -227,7 +188,6 @@ def fmt_ts(seconds):
 
 
 def fmt_srt_ts(seconds):
-    """Format seconds as HH:MM:SS,000 for SRT."""
     seconds = max(0, int(seconds))
     h = seconds // 3600
     m = (seconds % 3600) // 60
@@ -236,25 +196,21 @@ def fmt_srt_ts(seconds):
 
 
 def offset_timestamps(text, offset_seconds):
-    """Add offset_seconds to all [MM:SS] or [H:MM:SS] timestamps in text."""
     if offset_seconds == 0:
         return text
 
     def _replace(m):
-        original = m.group(0)
-        secs = parse_ts(original) + offset_seconds
+        secs = parse_ts(m.group(0)) + offset_seconds
         return fmt_ts(secs)
 
     return re.sub(r"\[\d{1,2}:\d{2}(?::\d{2})?\]", _replace, text)
 
 
 def strip_timestamps(text):
-    """Remove all [MM:SS] or [H:MM:SS] timestamps from text."""
     return re.sub(r"\[\d{1,2}:\d{2}(?::\d{2})?\]\s*", "", text)
 
 
 def get_speaker_timestamp(text, speaker):
-    """Find the first timestamp for a speaker. Returns seconds or None."""
     pattern = rf"\[(\d{{1,2}}:\d{{2}}(?::\d{{2}})?)\]\s*{re.escape(speaker)}:"
     m = re.search(pattern, text)
     if m:
@@ -263,10 +219,8 @@ def get_speaker_timestamp(text, speaker):
 
 
 def transcript_to_srt(text):
-    """Convert timestamped transcript to SRT subtitle format."""
     lines = text.strip().split("\n")
     entries = []
-
     for line in lines:
         line = line.strip()
         if not line:
@@ -277,10 +231,8 @@ def transcript_to_srt(text):
             content = m.group(2).strip()
             if content:
                 entries.append((ts_seconds, content))
-
     if not entries:
         return text
-
     srt_parts = []
     for i, (start, content) in enumerate(entries):
         if i + 1 < len(entries):
@@ -288,23 +240,20 @@ def transcript_to_srt(text):
         else:
             words = len(content.split())
             end = start + max(3, min(words // 2, 10))
-
         srt_parts.append(str(i + 1))
         srt_parts.append(f"{fmt_srt_ts(start)} --> {fmt_srt_ts(end)}")
         srt_parts.append(content)
         srt_parts.append("")
-
     return "\n".join(srt_parts)
 
 
-# ── Secure key storage ────────────────────────────────────────────────
+# ── Secure key storage ───────────────────────────────────────────────
 
 KEYCHAIN_SERVICE = "transcribe-cli"
 KEYCHAIN_ACCOUNT = "gemini-api-key"
 
 
 def _key_file_path():
-    """Get the key file path for Linux/Windows."""
     if sys.platform == "win32":
         base = Path(os.environ.get("APPDATA", str(Path.home())))
     else:
@@ -321,7 +270,6 @@ def _key_store_name():
 
 
 def save_api_key(key):
-    """Save API key securely."""
     if sys.platform == "darwin":
         subprocess.run(
             ["security", "delete-generic-password",
@@ -345,7 +293,6 @@ def save_api_key(key):
 
 
 def load_api_key():
-    """Load saved API key."""
     if sys.platform == "darwin":
         r = subprocess.run(
             ["security", "find-generic-password",
@@ -362,7 +309,6 @@ def load_api_key():
 
 
 def delete_api_key():
-    """Remove saved API key."""
     if sys.platform == "darwin":
         subprocess.run(
             ["security", "delete-generic-password",
@@ -375,159 +321,7 @@ def delete_api_key():
             kf.unlink()
 
 
-# ── UI Steps ──────────────────────────────────────────────────────────
-
-
-def show_header():
-    title = Text(justify="center")
-    title.append("\n")
-    title.append("T R A N S C R I B E\n", style="bold bright_white")
-    title.append("audio to text  ·  speaker detection  ·  gemini\n", style="dim")
-    title.append(f"v{VERSION}", style="dim italic")
-    C.print(Panel(
-        title,
-        border_style="bright_blue",
-        padding=(1, 4),
-        box=box.DOUBLE,
-    ))
-
-
-def step_api_key(arg_key):
-    step_header(1, "API Key")
-
-    if arg_key:
-        C.print("  [green]✓[/] API key provided via flag")
-        return arg_key
-
-    env_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    if env_key:
-        C.print("  [green]✓[/] API key loaded from environment")
-        return env_key
-
-    saved = load_api_key()
-    if saved:
-        C.print(f"  [green]✓[/] API key loaded from {_key_store_name()}")
-        return saved
-
-    C.print("  [dim]Paste your Gemini API key (input is hidden):[/]")
-    key = Prompt.ask("  [bright_blue]>[/] API key", password=True)
-    if not key.strip():
-        C.print("  [red]No key provided. Exiting.[/]")
-        sys.exit(1)
-    key = key.strip()
-
-    where = _key_store_name()
-    save = Prompt.ask(
-        f"  [dim]Save to {where} for next time?[/] [bright_blue]Y[/]/n",
-        default="y", show_default=False,
-    )
-    if save.strip().lower() in ("y", "yes", ""):
-        if save_api_key(key):
-            C.print(f"  [green]✓[/] API key saved to {where}")
-        else:
-            C.print("  [yellow]Could not save key[/]")
-
-    return key
-
-
-def step_model(arg_model):
-    step_header(2, "Model")
-
-    if arg_model:
-        C.print(f"  [green]✓[/] Using [bold]{arg_model}[/]")
-        return arg_model
-
-    C.print("  [dim]Select a model:[/]")
-    C.print()
-    for key, (_, label) in MODELS.items():
-        C.print(f"    [bright_blue]{key}[/]  {label}")
-    C.print()
-    choice = Prompt.ask(
-        "  [bright_blue]>[/] Model",
-        default="1", show_default=False,
-    )
-    model_id = MODELS.get(choice.strip(), (None, None))[0]
-    if model_id is None:
-        model_id = choice.strip()
-    C.print(f"  [green]✓[/] Using [bold]{model_id}[/]")
-    return model_id
-
-
-def step_audio_file(arg_path=None):
-    step_header(3, "Audio File")
-
-    if arg_path:
-        path = arg_path.strip().strip("'\"")
-    else:
-        C.print("  [dim]Enter path or drag & drop the file here:[/]")
-        raw = Prompt.ask("  [bright_blue]>[/] Audio file")
-        path = raw.strip().strip("'\"")
-
-    p = Path(path).resolve()
-    if not p.exists():
-        C.print(f"  [red]File not found: {path}[/]")
-        sys.exit(1)
-
-    duration = probe_audio(str(p))
-    if duration is None or duration <= 0:
-        C.print(f"  [red]Cannot read audio: {path}[/]")
-        sys.exit(1)
-
-    size_mb = p.stat().st_size / (1024 * 1024)
-    m, s = int(duration // 60), int(duration % 60)
-    C.print(
-        f"  [green]✓[/] Loaded [bold]{p.name}[/]  "
-        f"[dim]({m}m {s:02d}s · {size_mb:.1f} MB)[/]"
-    )
-    return str(p), duration
-
-
-def step_format(args):
-    """Interactive output format selection. Returns format dict."""
-    step_header(6, "Output Format")
-
-    # If CLI flags set, use those
-    if args.timestamps or args.srt:
-        fmt = {"txt": True, "timestamps": args.timestamps, "srt": args.srt}
-        parts = []
-        if args.timestamps:
-            parts.append("text + timestamps")
-        else:
-            parts.append("text")
-        if args.srt:
-            parts.append("SRT")
-        C.print(f"  [green]✓[/] Format: [bold]{' + '.join(parts)}[/]")
-        return fmt
-
-    C.print("  [dim]Select output format:[/]")
-    C.print()
-    C.print("    [bright_blue]1[/]  Plain text                [dim](default)[/]")
-    C.print("    [bright_blue]2[/]  Plain text with timestamps")
-    C.print("    [bright_blue]3[/]  SRT subtitles")
-    C.print("    [bright_blue]4[/]  All formats")
-    C.print()
-    choice = Prompt.ask("  [bright_blue]>[/] Format", default="1", show_default=False)
-
-    fmt = {"txt": True, "timestamps": False, "srt": False}
-    choice = choice.strip()
-    if choice == "2":
-        fmt["timestamps"] = True
-        C.print("  [green]✓[/] Format: [bold]text with timestamps[/]")
-    elif choice == "3":
-        fmt["srt"] = True
-        fmt["txt"] = False
-        C.print("  [green]✓[/] Format: [bold]SRT subtitles[/]")
-    elif choice == "4":
-        fmt["timestamps"] = True
-        fmt["srt"] = True
-        C.print("  [green]✓[/] Format: [bold]all formats[/]")
-    else:
-        C.print("  [green]✓[/] Format: [bold]plain text[/]")
-
-    return fmt
-
-
-# ── Transcription Engine ─────────────────────────────────────────────
+# ── Transcription engine ─────────────────────────────────────────────
 
 
 def upload_and_wait(client, filepath):
@@ -542,12 +336,9 @@ def upload_and_wait(client, filepath):
 
 
 def _parse_retry_delay(error_str):
-    """Parse the suggested retry delay (seconds) from an API error."""
-    # Match "retryDelay": "47s" or retryDelay: '47.123s'
     m = re.search(r"retryDelay['\"]?\s*:\s*['\"]?(\d+(?:\.\d+)?)\s*s", error_str)
     if m:
         return float(m.group(1))
-    # Match "retry in 47.123456s"
     m = re.search(r"retry in (\d+(?:\.\d+)?)\s*s", error_str, re.IGNORECASE)
     if m:
         return float(m.group(1))
@@ -580,17 +371,11 @@ Rules:
         except Exception as e:
             err = str(e).lower()
             retryable = (
-                "429" in err
-                or "503" in err
-                or "500" in err
-                or "resource_exhausted" in err
-                or "unavailable" in err
-                or "high demand" in err
-                or "internal" in err
-                or "rate" in err
+                "429" in err or "503" in err or "500" in err
+                or "resource_exhausted" in err or "unavailable" in err
+                or "high demand" in err or "internal" in err or "rate" in err
             )
             if retryable and attempt < max_retries - 1:
-                # Use the API's suggested delay if available
                 api_delay = _parse_retry_delay(str(e))
                 if api_delay:
                     wait = api_delay + random.uniform(1, 5)
@@ -608,62 +393,55 @@ def strip_fences(text):
     return text.strip()
 
 
-def do_transcribe_single(client, model, filepath):
-    with Progress(
-        SpinnerColumn(style="bright_blue"),
-        TextColumn("[dim]{task.description}[/]"),
-        console=C,
-        transient=True,
-    ) as prog:
-        prog.add_task("  Uploading & transcribing...", total=None)
-        f = upload_and_wait(client, filepath)
+def find_speakers(text):
+    return sorted(
+        set(re.findall(r"(Speaker \d+):", text)),
+        key=lambda s: int(re.search(r"\d+", s).group()),
+    )
+
+
+def do_transcribe_single(client, model, filepath, on_status=None):
+    if on_status:
+        on_status("Uploading...")
+    f = upload_and_wait(client, filepath)
+    try:
+        if on_status:
+            on_status("Transcribing...")
+        text = gemini_transcribe(client, model, f)
+    finally:
         try:
-            text = gemini_transcribe(client, model, f)
-        finally:
-            try:
-                client.files.delete(name=f.name)
-            except Exception:
-                pass
-    C.print("  [green]✓[/] Transcription complete")
+            client.files.delete(name=f.name)
+        except Exception:
+            pass
     return strip_fences(text)
 
 
-def do_transcribe_chunked(client, model, chunk_paths):
-    """Two-phase parallel pipeline: upload all, then transcribe all."""
+def do_transcribe_chunked(client, model, chunk_paths, on_upload=None, on_transcribe=None):
     n = len(chunk_paths)
 
     # Phase 1: Upload
     uploaded = [None] * n
     upload_errors = []
-    with Progress(
-        SpinnerColumn(style="bright_blue"),
-        TextColumn("[dim]{task.description}[/]"),
-        BarColumn(bar_width=30, complete_style="bright_blue", finished_style="green"),
-        TaskProgressColumn(),
-        console=C,
-    ) as prog:
-        task = prog.add_task("  Uploading parts", total=n)
-        with ThreadPoolExecutor(max_workers=n) as pool:
-            futs = {
-                pool.submit(upload_and_wait, client, p): i
-                for i, p in enumerate(chunk_paths)
-            }
-            for fut in as_completed(futs):
-                idx = futs[fut]
-                try:
-                    uploaded[idx] = fut.result()
-                except Exception as e:
-                    upload_errors.append((idx, str(e)))
-                prog.advance(task)
+    upload_done = [0]
 
-    if upload_errors:
-        for idx, err in upload_errors:
-            C.print(f"  [red]! Upload failed for part {idx + 1}: {err}[/]")
+    with ThreadPoolExecutor(max_workers=n) as pool:
+        futs = {
+            pool.submit(upload_and_wait, client, p): i
+            for i, p in enumerate(chunk_paths)
+        }
+        for fut in as_completed(futs):
+            idx = futs[fut]
+            try:
+                uploaded[idx] = fut.result()
+            except Exception as e:
+                upload_errors.append((idx, str(e)))
+            upload_done[0] += 1
+            if on_upload:
+                on_upload(upload_done[0], n)
 
     ready = [(i, f) for i, f in enumerate(uploaded) if f is not None]
-    C.print(f"  [green]✓[/] Uploaded [bold]{len(ready)}[/]/{n} files")
 
-    # Phase 2: Transcribe (limited concurrency to avoid rate limits)
+    # Phase 2: Transcribe
     max_concurrent = min(len(ready), 5)
 
     def _transcribe_one(idx, ufile):
@@ -672,30 +450,26 @@ def do_transcribe_chunked(client, model, chunk_paths):
 
     results = []
     errors = []
-    with Progress(
-        SpinnerColumn(style="bright_blue"),
-        TextColumn("[dim]{task.description}[/]"),
-        BarColumn(bar_width=30, complete_style="bright_blue", finished_style="green"),
-        TaskProgressColumn(),
-        console=C,
-    ) as prog:
-        task = prog.add_task("  Transcribing parts", total=len(ready))
-        with ThreadPoolExecutor(max_workers=max_concurrent) as pool:
-            futs = {
-                pool.submit(_transcribe_one, i, f): i
-                for i, f in ready
-            }
-            for fut in as_completed(futs):
-                try:
-                    idx, text = fut.result()
-                    results.append((idx, text))
-                except Exception as e:
-                    idx = futs[fut]
-                    errors.append((idx, str(e)))
-                    results.append((idx, f"[Error in part {idx + 1}: {e}]"))
-                prog.advance(task)
+    transcribe_done = [0]
 
-    # Cleanup uploaded files
+    with ThreadPoolExecutor(max_workers=max_concurrent) as pool:
+        futs = {
+            pool.submit(_transcribe_one, i, f): i
+            for i, f in ready
+        }
+        for fut in as_completed(futs):
+            try:
+                idx, text = fut.result()
+                results.append((idx, text))
+            except Exception as e:
+                idx = futs[fut]
+                errors.append((idx, str(e)))
+                results.append((idx, f"[Error in part {idx + 1}: {e}]"))
+            transcribe_done[0] += 1
+            if on_transcribe:
+                on_transcribe(transcribe_done[0], len(ready))
+
+    # Cleanup
     for f in uploaded:
         if f is not None:
             try:
@@ -703,11 +477,7 @@ def do_transcribe_chunked(client, model, chunk_paths):
             except Exception:
                 pass
 
-    if errors:
-        for idx, err in errors:
-            C.print(f"  [red]! Part {idx + 1} failed: {err}[/]")
-
-    # Merge with timestamp offsets
+    # Merge
     results.sort()
     merged_parts = []
     for idx, text in results:
@@ -715,300 +485,743 @@ def do_transcribe_chunked(client, model, chunk_paths):
         chunk_text = offset_timestamps(chunk_text, idx * MAX_CHUNK_S)
         merged_parts.append(chunk_text)
 
-    C.print(f"  [green]✓[/] Transcription complete")
-    return "\n\n".join(merged_parts)
+    return "\n\n".join(merged_parts), errors
 
 
-# ── Speaker Assignment ────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
+#  Textual GUI
+# ══════════════════════════════════════════════════════════════════════
+
+APP_CSS = """
+Screen {
+    background: $surface;
+}
+
+/* ── State containers ────────────────────────────────────────────── */
+
+#setup, #processing, #speakers, #result {
+    height: 1fr;
+    padding: 1 4;
+}
+
+.section-label {
+    text-style: bold;
+    color: $accent;
+    margin: 1 0 0 0;
+}
+
+.hint {
+    color: $text-muted;
+    margin: 0 0 1 0;
+}
+
+/* ── Setup ───────────────────────────────────────────────────────── */
+
+#file-input {
+    margin: 0 0 0 0;
+}
+
+#file-info {
+    color: $text-muted;
+    height: 1;
+    margin: 0 0 1 0;
+}
+
+#transcribe-btn {
+    margin: 1 0;
+    width: 100%;
+}
+
+/* ── Processing ──────────────────────────────────────────────────── */
+
+.progress-row {
+    height: auto;
+    margin: 0 0 1 0;
+}
+
+.progress-label {
+    margin: 0 0 0 0;
+}
+
+/* ── Speakers ────────────────────────────────────────────────────── */
+
+.speaker-row {
+    height: auto;
+    margin: 0 0 1 0;
+    padding: 1;
+    border: solid $accent 30%;
+}
+
+.speaker-sample {
+    color: $text-muted;
+    margin: 0 0 0 0;
+}
+
+.speaker-controls {
+    layout: horizontal;
+    height: auto;
+    margin: 1 0 0 0;
+}
+
+.speaker-input {
+    width: 1fr;
+    margin: 0 1 0 0;
+}
+
+.play-btn {
+    min-width: 10;
+}
+
+#speakers-continue {
+    margin: 1 0;
+    width: 100%;
+}
+
+/* ── Result ──────────────────────────────────────────────────────── */
+
+#format-select {
+    margin: 0 0 1 0;
+}
+
+#transcript-view {
+    height: 1fr;
+    min-height: 10;
+    margin: 0 0 1 0;
+}
+
+.save-row {
+    layout: horizontal;
+    height: auto;
+    margin: 0 0 1 0;
+}
+
+.save-input {
+    width: 1fr;
+    margin: 0 1 0 0;
+}
+
+.save-btn {
+    min-width: 12;
+}
+
+#summary {
+    text-align: center;
+    color: $success;
+    margin: 1 0;
+    text-style: bold;
+}
+
+#new-btn {
+    margin: 1 0;
+    width: 100%;
+}
+
+/* ── Settings modal ──────────────────────────────────────────────── */
+
+SettingsScreen {
+    align: center middle;
+}
+
+#settings-dialog {
+    width: 70;
+    height: auto;
+    max-height: 22;
+    border: thick $accent;
+    padding: 1 2;
+    background: $surface;
+}
+
+#settings-dialog .section-label {
+    margin: 0 0 1 0;
+}
+
+#key-status {
+    margin: 0 0 1 0;
+}
+
+#key-input {
+    margin: 0 0 1 0;
+}
+
+.settings-buttons {
+    layout: horizontal;
+    height: auto;
+}
+
+.settings-buttons Button {
+    margin: 0 1 0 0;
+}
+"""
 
 
-def find_speakers(text):
-    return sorted(
-        set(re.findall(r"(Speaker \d+):", text)),
-        key=lambda s: int(re.search(r"\d+", s).group()),
-    )
+# ── Settings Modal ───────────────────────────────────────────────────
 
 
-def step_assign_speakers(text, speakers, filepath):
-    step_header(5, "Speakers")
+class SettingsScreen(ModalScreen):
+    """Modal dialog for API key management."""
 
-    table = Table(
-        box=box.ROUNDED,
-        border_style="bright_blue",
-        show_header=True,
-        header_style="bold",
-        padding=(0, 1),
-    )
-    table.add_column("#", style="bright_blue bold", width=12)
-    table.add_column("Sample", style="dim")
+    BINDINGS = [Binding("escape", "close", "Close")]
 
-    for spk in speakers:
-        m = re.search(rf"{re.escape(spk)}:\s*(.+)", text)
-        sample = m.group(1)[:80] if m else ""
-        if m and len(m.group(1)) > 80:
-            sample += "..."
-        table.add_row(spk, sample)
+    def __init__(self, current_key: str = ""):
+        super().__init__()
+        self._current_key = current_key
 
-    C.print(table)
-    C.print()
-    C.print("  [dim]Assign real names  (Enter = keep, [bold]p[/bold] = play voice sample):[/]")
-    C.print()
-
-    renames = {}
-    active_player = None
-
-    for spk in speakers:
-        while True:
-            try:
-                name = Prompt.ask(
-                    f"    [bright_blue]{spk}[/] [dim]→[/]",
-                    default="", show_default=False,
+    def compose(self) -> ComposeResult:
+        with Container(id="settings-dialog"):
+            yield Static("Settings", classes="section-label")
+            if self._current_key:
+                masked = self._current_key[:8] + "..." + self._current_key[-4:]
+                yield Static(
+                    f"  API Key:  saved  ({masked})",
+                    id="key-status",
                 )
-            except (EOFError, KeyboardInterrupt):
-                C.print()
-                if active_player:
-                    active_player[0].terminate()
-                    try:
-                        os.unlink(active_player[1])
-                    except OSError:
-                        pass
-                return text
+            else:
+                yield Static(
+                    "  API Key:  not set",
+                    id="key-status",
+                )
+            yield Input(
+                placeholder="Paste new API key...",
+                password=True,
+                id="key-input",
+            )
+            with Horizontal(classes="settings-buttons"):
+                yield Button("Save", id="save-key", variant="primary")
+                yield Button("Delete", id="delete-key", variant="error")
+                yield Button("Close", id="close-settings")
 
-            # Stop any playing audio
-            if active_player:
-                active_player[0].terminate()
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "save-key":
+            new_key = self.query_one("#key-input", Input).value.strip()
+            if new_key:
+                if save_api_key(new_key):
+                    self.app.notify(f"API key saved to {_key_store_name()}")
+                    self.dismiss(new_key)
+                else:
+                    self.app.notify("Could not save key", severity="error")
+            else:
+                self.app.notify("Enter a key first", severity="warning")
+        elif event.button.id == "delete-key":
+            delete_api_key()
+            self.app.notify("API key deleted")
+            self.dismiss("")
+        elif event.button.id == "close-settings":
+            self.dismiss(None)
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
+# ── Main App ─────────────────────────────────────────────────────────
+
+
+class TranscribeApp(App):
+    TITLE = "TRANSCRIBE"
+    SUB_TITLE = "audio to text · speaker detection · gemini"
+    CSS = APP_CSS
+
+    BINDINGS = [
+        Binding("ctrl+k", "settings", "Settings"),
+        Binding("ctrl+q", "quit", "Quit"),
+    ]
+
+    def __init__(self, initial_file=None, initial_key=None):
+        super().__init__()
+        self._initial_file = initial_file
+        self._initial_key = initial_key
+        self.api_key = ""
+        self.audio_path = ""
+        self.audio_duration = 0.0
+        self.selected_model = MODELS[0][0]
+        self.raw_transcript = ""
+        self.speaker_list: list[str] = []
+        self.active_player = None
+        self.selected_format = 0  # 0=text, 1=timestamps, 2=srt, 3=all
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=False)
+
+        # ── State 1: Setup ───────────────────────────────────────────
+        with VerticalScroll(id="setup"):
+            yield Static("Model", classes="section-label")
+            with RadioSet(id="model-select"):
+                for i, (_, label) in enumerate(MODELS):
+                    yield RadioButton(label, value=(i == 0))
+            yield Static("Audio File", classes="section-label")
+            yield Input(
+                placeholder="Enter path or drag & drop a file...",
+                id="file-input",
+            )
+            yield Static("", id="file-info")
+            yield Button(
+                "Transcribe",
+                id="transcribe-btn",
+                variant="primary",
+                disabled=True,
+            )
+
+        # ── State 2: Processing ──────────────────────────────────────
+        with VerticalScroll(id="processing"):
+            yield Static("Processing...", id="status-label", classes="section-label")
+            with Container(classes="progress-row"):
+                yield Static("", id="split-label", classes="progress-label")
+                yield ProgressBar(id="split-progress", total=100)
+            with Container(classes="progress-row"):
+                yield Static("", id="upload-label", classes="progress-label")
+                yield ProgressBar(id="upload-progress", total=100)
+            with Container(classes="progress-row"):
+                yield Static("", id="transcribe-label", classes="progress-label")
+                yield ProgressBar(id="transcribe-progress", total=100)
+
+        # ── State 3: Speakers ────────────────────────────────────────
+        with VerticalScroll(id="speakers"):
+            yield Static("Assign Speaker Names", classes="section-label")
+            yield Static(
+                "Edit names below, then click Continue. Click Play to hear a sample.",
+                classes="hint",
+            )
+            yield Container(id="speaker-list")
+            yield Button("Continue", id="speakers-continue", variant="primary")
+
+        # ── State 4: Result ──────────────────────────────────────────
+        with VerticalScroll(id="result"):
+            yield Static("Output Format", classes="section-label")
+            with RadioSet(id="format-select"):
+                yield RadioButton("Plain text", value=True)
+                yield RadioButton("Text + timestamps")
+                yield RadioButton("SRT subtitles")
+                yield RadioButton("All formats")
+            yield Static("Transcript", classes="section-label")
+            yield TextArea(id="transcript-view", read_only=True)
+            yield Static("Save", classes="section-label")
+            with Horizontal(classes="save-row", id="save-text-row"):
+                yield Input(id="save-path", placeholder="Save path...", classes="save-input")
+                yield Button("Save", id="save-btn", variant="primary", classes="save-btn")
+            with Horizontal(classes="save-row", id="save-srt-row"):
+                yield Input(id="save-srt-path", placeholder="SRT path...", classes="save-input")
+                yield Button("Save SRT", id="save-srt-btn", variant="primary", classes="save-btn")
+            yield Static("", id="summary")
+            yield Button("New Transcription", id="new-btn")
+
+        yield Footer()
+
+    def on_mount(self) -> None:
+        # Load API key
+        if self._initial_key:
+            self.api_key = self._initial_key
+        else:
+            self.api_key = (
+                load_api_key()
+                or os.environ.get("GEMINI_API_KEY", "")
+                or os.environ.get("GOOGLE_API_KEY", "")
+            )
+
+        # Show only setup
+        self._switch_to("setup")
+
+        # Pre-fill file if provided
+        if self._initial_file:
+            self.query_one("#file-input", Input).value = self._initial_file
+
+        # If no key, open settings
+        if not self.api_key:
+            self.set_timer(0.3, self.action_settings)
+
+    def _switch_to(self, state_id: str) -> None:
+        """Show one state container, hide the rest."""
+        for sid in ("setup", "processing", "speakers", "result"):
+            self.query_one(f"#{sid}").display = (sid == state_id)
+
+    # ── Event Handlers ───────────────────────────────────────────────
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "file-input":
+            self._validate_file(event.value)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        btn_id = event.button.id or ""
+
+        if btn_id == "transcribe-btn":
+            if not self.api_key:
+                self.notify("No API key set. Press Ctrl+K to configure.", severity="error")
+                return
+            if not self.audio_path:
+                self.notify("Select an audio file first.", severity="warning")
+                return
+            self._start_transcription()
+
+        elif btn_id == "speakers-continue":
+            self._finish_speakers()
+
+        elif btn_id == "save-btn":
+            self._save_text()
+
+        elif btn_id == "save-srt-btn":
+            self._save_srt()
+
+        elif btn_id == "new-btn":
+            self._reset()
+
+        elif btn_id.startswith("play-"):
+            try:
+                idx = int(btn_id.split("-")[1])
+                if idx < len(self.speaker_list):
+                    self._play_speaker(self.speaker_list[idx])
+            except (ValueError, IndexError):
+                pass
+
+    def on_radio_set_changed(self, event: RadioSet.Changed) -> None:
+        if event.radio_set.id == "model-select":
+            if event.index < len(MODELS):
+                self.selected_model = MODELS[event.index][0]
+        elif event.radio_set.id == "format-select":
+            self.selected_format = event.index
+            self._update_transcript_view()
+
+    # ── Actions ──────────────────────────────────────────────────────
+
+    def action_settings(self) -> None:
+        self.push_screen(SettingsScreen(self.api_key), callback=self._on_settings_result)
+
+    def _on_settings_result(self, result) -> None:
+        if result is not None:
+            self.api_key = result
+
+    # ── File Validation ──────────────────────────────────────────────
+
+    def _validate_file(self, raw: str) -> None:
+        path = raw.strip().strip("'\"")
+        p = Path(path)
+        if p.exists() and p.is_file():
+            duration = probe_audio(str(p))
+            if duration and duration > 0:
+                self.audio_path = str(p.resolve())
+                self.audio_duration = duration
+                size_mb = p.stat().st_size / (1024 * 1024)
+                m, s = int(duration // 60), int(duration % 60)
+                self.query_one("#file-info", Static).update(
+                    f"  {m}m {s:02d}s  ·  {size_mb:.1f} MB"
+                )
+                self.query_one("#transcribe-btn", Button).disabled = False
+                return
+        self.audio_path = ""
+        self.audio_duration = 0.0
+        self.query_one("#file-info", Static).update("")
+        self.query_one("#transcribe-btn", Button).disabled = True
+
+    # ── Transcription ────────────────────────────────────────────────
+
+    def _start_transcription(self) -> None:
+        self._switch_to("processing")
+        self.query_one("#status-label", Static).update("Starting...")
+        for pid in ("split", "upload", "transcribe"):
+            self.query_one(f"#{pid}-progress", ProgressBar).update(progress=0, total=100)
+            self.query_one(f"#{pid}-label", Static).update("")
+        self._run_transcription()
+
+    @work(thread=True, exclusive=True)
+    def _run_transcription(self) -> None:
+        try:
+            client = genai.Client(api_key=self.api_key)
+            filepath = self.audio_path
+            model = self.selected_model
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                # Split
+                def on_split(current, total):
+                    self.call_from_thread(
+                        self._set_progress, "split", current, total, "Splitting audio"
+                    )
+
+                self.call_from_thread(self._set_status, "Analyzing audio...")
+                chunks, duration = split_audio(filepath, MAX_CHUNK_S, tmpdir, on_progress=on_split)
+
+                if chunks is None:
+                    # Single file — no splitting needed
+                    self.call_from_thread(self._set_progress, "split", 1, 1, "No splitting needed")
+
+                    def on_status(msg):
+                        self.call_from_thread(self._set_status, msg)
+
+                    self.call_from_thread(self._set_progress, "upload", 0, 1, "Uploading")
+                    self.call_from_thread(self._set_progress, "transcribe", 0, 1, "Transcribing")
+
+                    transcript = do_transcribe_single(
+                        client, model, filepath, on_status=on_status
+                    )
+
+                    self.call_from_thread(self._set_progress, "upload", 1, 1, "Uploaded")
+                    self.call_from_thread(self._set_progress, "transcribe", 1, 1, "Transcribed")
+                else:
+                    # Chunked
+                    n = len(chunks)
+                    self.call_from_thread(
+                        self._set_progress, "split", n, n, f"Split into {n} parts"
+                    )
+
+                    def on_upload(current, total):
+                        self.call_from_thread(
+                            self._set_progress, "upload", current, total, "Uploading"
+                        )
+
+                    def on_transcribe(current, total):
+                        self.call_from_thread(
+                            self._set_progress, "transcribe", current, total, "Transcribing"
+                        )
+
+                    transcript, errors = do_transcribe_chunked(
+                        client, model, chunks,
+                        on_upload=on_upload,
+                        on_transcribe=on_transcribe,
+                    )
+
+                    if errors:
+                        for idx, err in errors:
+                            self.call_from_thread(
+                                self.notify,
+                                f"Part {idx + 1} failed: {err[:120]}",
+                                severity="error",
+                                timeout=10,
+                            )
+
+            self.raw_transcript = transcript
+            self.speaker_list = find_speakers(transcript)
+
+            self.call_from_thread(self._set_status, "Transcription complete")
+
+            if self.speaker_list:
+                self.call_from_thread(self._show_speakers)
+            else:
+                self.call_from_thread(self._show_result)
+
+        except Exception as e:
+            self.call_from_thread(self._on_error, str(e))
+
+    def _set_status(self, msg: str) -> None:
+        self.query_one("#status-label", Static).update(msg)
+
+    def _set_progress(self, phase: str, current: int, total: int, label: str) -> None:
+        self.query_one(f"#{phase}-progress", ProgressBar).update(
+            total=total, progress=current,
+        )
+        self.query_one(f"#{phase}-label", Static).update(f"  {label}  ({current}/{total})")
+
+    def _on_error(self, error: str) -> None:
+        self.notify(f"Error: {error[:200]}", severity="error", timeout=10)
+        self._switch_to("setup")
+
+    # ── Speakers ─────────────────────────────────────────────────────
+
+    def _show_speakers(self) -> None:
+        container = self.query_one("#speaker-list", Container)
+        container.remove_children()
+
+        for i, spk in enumerate(self.speaker_list):
+            m = re.search(rf"{re.escape(spk)}:\s*(.+)", self.raw_transcript)
+            sample = ""
+            if m:
+                sample = m.group(1)[:70]
+                if len(m.group(1)) > 70:
+                    sample += "..."
+
+            row = Container(classes="speaker-row")
+            container.mount(row)
+            row.mount(Static(f'{spk}:  "{sample}"', classes="speaker-sample"))
+            controls = Horizontal(classes="speaker-controls")
+            row.mount(controls)
+            controls.mount(
+                Input(value="", placeholder=f"Name for {spk}...", id=f"name-{i}", classes="speaker-input")
+            )
+            controls.mount(
+                Button("Play", id=f"play-{i}", classes="play-btn")
+            )
+
+        self._switch_to("speakers")
+
+    def _play_speaker(self, speaker: str) -> None:
+        # Kill existing player
+        if self.active_player:
+            self.active_player[0].terminate()
+            try:
+                os.unlink(self.active_player[1])
+            except OSError:
+                pass
+            self.active_player = None
+
+        ts = get_speaker_timestamp(self.raw_transcript, speaker)
+        if ts is not None:
+            proc, tmp_file = play_audio_clip(self.audio_path, ts)
+            if proc:
+                self.active_player = (proc, tmp_file)
+                self.notify(f"Playing {speaker} from {fmt_ts(ts)}")
+            else:
+                self.notify("No audio player found", severity="warning")
                 try:
-                    os.unlink(active_player[1])
+                    os.unlink(tmp_file)
                 except OSError:
                     pass
-                active_player = None
+        else:
+            self.notify(f"No timestamp found for {speaker}", severity="warning")
 
-            if name.strip().lower() == "p":
-                ts = get_speaker_timestamp(text, spk)
-                if ts is not None:
-                    C.print(f"      [dim]Playing from {fmt_ts(ts)}...[/]")
-                    proc, tmp_file = play_audio_clip(filepath, ts)
-                    if proc:
-                        active_player = (proc, tmp_file)
-                    else:
-                        C.print("      [yellow]No audio player found[/]")
-                        try:
-                            os.unlink(tmp_file)
-                        except OSError:
-                            pass
-                else:
-                    C.print("      [yellow]No timestamp found for this speaker[/]")
-                continue
-            else:
-                if name.strip():
-                    renames[spk] = name.strip()
-                break
+    def _finish_speakers(self) -> None:
+        # Kill any active player
+        if self.active_player:
+            self.active_player[0].terminate()
+            try:
+                os.unlink(self.active_player[1])
+            except OSError:
+                pass
+            self.active_player = None
 
-    # Clean up any lingering player
-    if active_player:
-        active_player[0].terminate()
+        # Apply renames
+        renames = {}
+        for i, spk in enumerate(self.speaker_list):
+            try:
+                inp = self.query_one(f"#name-{i}", Input)
+                name = inp.value.strip()
+                if name:
+                    renames[spk] = name
+            except Exception:
+                pass
+
+        for old, new in renames.items():
+            self.raw_transcript = re.sub(
+                rf"\b{re.escape(old)}:", f"{new}:", self.raw_transcript
+            )
+
+        if renames:
+            self.notify(f"Renamed {len(renames)} speaker(s)")
+
+        self._show_result()
+
+    # ── Result ───────────────────────────────────────────────────────
+
+    def _show_result(self) -> None:
+        stem = Path(self.audio_path).stem
+        audio_dir = Path(self.audio_path).parent.resolve()
+        self.query_one("#save-path", Input).value = str(audio_dir / f"transcript_{stem}.txt")
+        self.query_one("#save-srt-path", Input).value = str(audio_dir / f"transcript_{stem}.srt")
+
+        # Default: hide SRT row, show text row
+        self.query_one("#save-srt-row").display = False
+        self.query_one("#save-text-row").display = True
+        self.selected_format = 0
+
+        self._update_transcript_view()
+
+        # Summary
+        n = len(self.speaker_list) if self.speaker_list else 0
+        m, s = int(self.audio_duration // 60), int(self.audio_duration % 60)
+        self.query_one("#summary", Static).update(
+            f"Done  ·  {n} speaker{'s' if n != 1 else ''}  ·  {m}m {s:02d}s audio"
+        )
+
+        self._switch_to("result")
+
+    def _update_transcript_view(self) -> None:
+        """Update transcript display and save rows based on format selection."""
+        if not self.raw_transcript:
+            return
+
+        ta = self.query_one("#transcript-view", TextArea)
+        text_row = self.query_one("#save-text-row")
+        srt_row = self.query_one("#save-srt-row")
+
+        if self.selected_format == 0:  # Plain text
+            ta.text = strip_timestamps(self.raw_transcript)
+            text_row.display = True
+            srt_row.display = False
+        elif self.selected_format == 1:  # Text + timestamps
+            ta.text = self.raw_transcript
+            text_row.display = True
+            srt_row.display = False
+        elif self.selected_format == 2:  # SRT
+            ta.text = transcript_to_srt(self.raw_transcript)
+            text_row.display = False
+            srt_row.display = True
+        elif self.selected_format == 3:  # All
+            ta.text = self.raw_transcript
+            text_row.display = True
+            srt_row.display = True
+
+    def _save_text(self) -> None:
+        path_str = self.query_one("#save-path", Input).value.strip()
+        if not path_str:
+            self.notify("Enter a save path", severity="warning")
+            return
+
+        if self.selected_format in (0, 3):
+            text = strip_timestamps(self.raw_transcript)
+        else:
+            text = self.raw_transcript
+
+        path = Path(path_str).resolve()
         try:
-            os.unlink(active_player[1])
-        except OSError:
-            pass
+            path.write_text(text, encoding="utf-8")
+            self.notify(f"Saved to {path}")
+        except Exception as e:
+            self.notify(f"Could not save: {e}", severity="error")
 
-    for old, new in renames.items():
-        text = re.sub(rf"\b{re.escape(old)}:", f"{new}:", text)
+    def _save_srt(self) -> None:
+        path_str = self.query_one("#save-srt-path", Input).value.strip()
+        if not path_str:
+            self.notify("Enter a save path", severity="warning")
+            return
 
-    if renames:
-        C.print()
-        C.print(f"  [green]✓[/] Renamed {len(renames)} speaker(s)")
+        srt = transcript_to_srt(self.raw_transcript)
+        path = Path(path_str).resolve()
+        try:
+            path.write_text(srt, encoding="utf-8")
+            self.notify(f"Saved SRT to {path}")
+        except Exception as e:
+            self.notify(f"Could not save: {e}", severity="error")
 
-    return text
-
-
-# ── Output & Save ────────────────────────────────────────────────────
-
-
-def step_output(text):
-    C.print()
-    C.print(
-        Panel(
-            text,
-            title="[bold]Transcript[/]",
-            title_align="left",
-            border_style="green",
-            padding=(1, 2),
-        )
-    )
-
-
-def step_save(txt_text, srt_text, filepath, fmt):
-    step_header(7, "Save")
-
-    audio_dir = Path(filepath).parent.resolve()
-    stem = Path(filepath).stem
-    save_txt = fmt.get("txt", True)
-    save_srt = fmt.get("srt", False)
-
-    if save_txt and txt_text:
-        default_txt = str(audio_dir / f"transcript_{stem}.txt")
-        C.print("  [dim]Press Enter to save, type a path, or [bold]n[/bold] to skip.[/]")
-        save = Prompt.ask(
-            "  [bright_blue]>[/] Save text to",
-            default=default_txt, show_default=True,
-        )
-        if save.strip().lower() not in ("n", "no"):
-            path = Path(save.strip().strip("'\"")).resolve()
+    def _reset(self) -> None:
+        """Reset for a new transcription."""
+        # Kill any active player
+        if self.active_player:
+            self.active_player[0].terminate()
             try:
-                path.write_text(txt_text, encoding="utf-8")
-                C.print(f"  [green]✓[/] Saved to [bold]{path}[/]")
-            except Exception as e:
-                C.print(f"  [red]Could not save: {e}[/]")
-        else:
-            C.print("  [dim]Skipped text.[/]")
+                os.unlink(self.active_player[1])
+            except OSError:
+                pass
+            self.active_player = None
 
-    if save_srt and srt_text:
-        default_srt = str(audio_dir / f"transcript_{stem}.srt")
-        C.print()
-        save = Prompt.ask(
-            "  [bright_blue]>[/] Save SRT to ",
-            default=default_srt, show_default=True,
-        )
-        if save.strip().lower() not in ("n", "no"):
-            path = Path(save.strip().strip("'\"")).resolve()
-            try:
-                path.write_text(srt_text, encoding="utf-8")
-                C.print(f"  [green]✓[/] Saved to [bold]{path}[/]")
-            except Exception as e:
-                C.print(f"  [red]Could not save SRT: {e}[/]")
-        else:
-            C.print("  [dim]Skipped SRT.[/]")
-
-    if not save_txt and not save_srt:
-        C.print("  [dim]Nothing to save.[/]")
+        self.audio_path = ""
+        self.audio_duration = 0.0
+        self.raw_transcript = ""
+        self.speaker_list = []
+        self.selected_format = 0
+        self.query_one("#file-input", Input).value = ""
+        self.query_one("#file-info", Static).update("")
+        self.query_one("#transcribe-btn", Button).disabled = True
+        self._switch_to("setup")
 
 
-# ── Main ──────────────────────────────────────────────────────────────
+# ── Entry Point ──────────────────────────────────────────────────────
 
 
 def main():
-    import argparse
-
-    ap = argparse.ArgumentParser(add_help=False)
-    ap.add_argument("audio", nargs="?", default=None)
-    ap.add_argument("-k", "--api-key", default=None)
-    ap.add_argument("-o", "--output", default=None)
-    ap.add_argument("-m", "--model", default=None)
-    ap.add_argument("-t", "--timestamps", action="store_true")
-    ap.add_argument("--srt", action="store_true")
-    ap.add_argument("--no-speakers", action="store_true")
-    ap.add_argument("--reset-key", action="store_true")
-    ap.add_argument("-h", "--help", action="store_true")
+    ap = argparse.ArgumentParser(
+        description="Audio transcription with speaker detection",
+        add_help=True,
+    )
+    ap.add_argument("audio", nargs="?", default=None, help="Audio file path")
+    ap.add_argument("-k", "--api-key", default=None, help="Gemini API key")
+    ap.add_argument("--reset-key", action="store_true", help="Remove saved API key")
     args = ap.parse_args()
 
     if args.reset_key:
         delete_api_key()
-        C.print(f"  [green]✓[/] API key removed from {_key_store_name()}")
+        print(f"  API key removed from {_key_store_name()}")
         sys.exit(0)
 
-    if args.help:
-        show_header()
-        C.print()
-        C.print("  [bold]Usage:[/]  uv run transcribe.py [audio_file]")
-        C.print()
-        C.print("  [dim]Options:[/]")
-        C.print("    [bright_blue]-k[/]  --api-key        Gemini API key")
-        C.print("    [bright_blue]-o[/]  --output         Save transcript to file")
-        C.print("    [bright_blue]-m[/]  --model          Model name")
-        C.print("    [bright_blue]-t[/]  --timestamps     Include timestamps in output")
-        C.print("    [bright_blue]    --srt[/]            Save as SRT subtitle file")
-        C.print("    [bright_blue]    --no-speakers[/]    Skip speaker name assignment")
-        C.print("    [bright_blue]    --reset-key[/]      Remove saved API key")
-        C.print()
-        C.print("  [dim]Just run [bold]uv run transcribe.py[/bold] and follow the prompts.[/]")
-        C.print()
-        sys.exit(0)
-
-    show_header()
-
-    # Step 1: API key
-    key = step_api_key(args.api_key)
-    client = genai.Client(api_key=key)
-
-    # Step 2: Model
-    model = step_model(args.model)
-
-    # Step 3: Audio file
-    filepath, duration = step_audio_file(args.audio)
-
-    # Step 4: Transcribe
-    step_header(4, "Transcribe")
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        chunk_paths, _ = split_audio(filepath, MAX_CHUNK_S, tmpdir)
-        if chunk_paths is None:
-            transcript = do_transcribe_single(client, model, filepath)
-        else:
-            transcript = do_transcribe_chunked(client, model, chunk_paths)
-
-    # Step 5: Speaker names
-    speakers = find_speakers(transcript)
-    if speakers and not args.no_speakers:
-        transcript = step_assign_speakers(transcript, speakers, filepath)
-
-    # Step 6: Output format
-    fmt = step_format(args)
-
-    # Generate outputs
-    srt_text = transcript_to_srt(transcript) if fmt.get("srt") else None
-    show_ts = fmt.get("timestamps") or (fmt.get("srt") and not fmt.get("txt"))
-    display_text = transcript if show_ts else strip_timestamps(transcript)
-    txt_output = transcript if fmt.get("timestamps") else strip_timestamps(transcript)
-
-    # Show transcript
-    step_output(display_text)
-
-    # Step 7: Save
-    if args.output:
-        try:
-            Path(args.output).write_text(txt_output, encoding="utf-8")
-            C.print(f"\n  [green]✓[/] Saved to [bold]{args.output}[/]")
-        except Exception as e:
-            C.print(f"\n  [red]Could not save: {e}[/]")
-        if srt_text:
-            srt_path = Path(args.output).with_suffix(".srt")
-            try:
-                srt_path.write_text(srt_text, encoding="utf-8")
-                C.print(f"  [green]✓[/] Saved to [bold]{srt_path}[/]")
-            except Exception as e:
-                C.print(f"  [red]Could not save SRT: {e}[/]")
-    else:
-        step_save(txt_output, srt_text, filepath, fmt)
-
-    # Summary footer
-    n_speakers = len(speakers) if speakers else 0
-    m, s = int(duration // 60), int(duration % 60)
-    fmt_parts = []
-    if fmt.get("txt"):
-        if fmt.get("timestamps"):
-            fmt_parts.append("text + timestamps")
-        else:
-            fmt_parts.append("text")
-    if fmt.get("srt"):
-        fmt_parts.append("SRT")
-    if not fmt_parts:
-        fmt_parts.append("text")
-
-    C.print()
-    C.print(Rule(style="dim"))
-    C.print(
-        f"  [green]✓[/] [bold]Done[/]  [dim]·  "
-        f"{n_speakers} speaker{'s' if n_speakers != 1 else ''}  ·  "
-        f"{m}m {s:02d}s audio  ·  "
-        f"{' + '.join(fmt_parts)}[/]"
+    app = TranscribeApp(
+        initial_file=args.audio,
+        initial_key=args.api_key,
     )
-    C.print()
+    app.run()
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        C.print("\n  [yellow]Interrupted.[/]")
-        sys.exit(130)
+    main()

@@ -1,23 +1,19 @@
 # Transcribe
 
-A terminal app that transcribes audio files with speaker detection using Google Gemini.
+A terminal GUI app that transcribes audio files with speaker detection using Google Gemini.
 
-```
-╔══════════════════════════════════════════════════════╗
-║               T R A N S C R I B E                    ║
-║      audio to text  ·  speaker detection  ·  gemini  ║
-╚══════════════════════════════════════════════════════╝
-```
+Built with [Textual](https://textual.textualize.io/) for a proper GUI experience right in your terminal.
 
 ## Features
 
-- **Speaker detection** — automatically identifies different speakers and lets you assign real names
+- **Terminal GUI** — real buttons, inputs, progress bars, and radio selectors — not just a CLI
+- **Speaker detection** — automatically identifies speakers and lets you assign real names
 - **Audio preview** — play a voice sample of each speaker to identify who's who
 - **Long audio support** — files over 10 minutes are split and transcribed in parallel
 - **Multiple formats** — plain text, timestamped text, or SRT subtitles
-- **Verbatim mode** — preserves filler words, pauses, laughter, and other non-speech sounds
-- **Secure API key storage** — saved in macOS Keychain, Windows AppData, or Linux `~/.config`
-- **Multiple models** — choose between Gemini 3 Flash and Gemini 2.5 Flash
+- **Verbatim transcription** — preserves filler words, pauses, laughter, and other sounds
+- **Settings dialog** — change your API key anytime with `Ctrl+K`
+- **Secure key storage** — macOS Keychain, Windows AppData, or Linux `~/.config`
 - **Cross-platform** — works on macOS, Linux, and Windows
 
 ## Quick Start
@@ -56,37 +52,26 @@ uv run https://raw.githubusercontent.com/marcelwachter/transcribe/main/transcrib
 ## Usage
 
 ```bash
-# Interactive (recommended)
+# Launch the GUI
 uv run transcribe.py
 
-# With arguments
+# Pre-load an audio file
 uv run transcribe.py recording.mp3
-uv run transcribe.py -k YOUR_KEY interview.m4a -o notes.txt
-uv run transcribe.py -t recording.mp3       # include timestamps
-uv run transcribe.py --srt recording.mp3     # save as SRT subtitles
+
+# Pre-set API key
+uv run transcribe.py -k YOUR_KEY
+
+# Remove saved API key
+uv run transcribe.py --reset-key
 ```
 
-The app walks you through everything:
+## Keyboard Shortcuts
 
-1. **API key** — paste your Gemini key once, it's saved for next time
-2. **Model** — pick Gemini 3 Flash (recommended) or 2.5 Flash
-3. **Audio file** — enter a path or drag & drop
-4. **Transcription** — automatic splitting + parallel processing for long files
-5. **Speaker names** — see who said what, play audio samples, assign real names
-6. **Output format** — choose plain text, timestamped, SRT, or all
-7. **Save** — press Enter to save with a default filename
-
-## Options
-
-| Flag | Description |
-|------|-------------|
-| `-k`, `--api-key` | Gemini API key |
-| `-o`, `--output` | Save transcript to file |
-| `-m`, `--model` | Model name |
-| `-t`, `--timestamps` | Include `[MM:SS]` timestamps in output |
-| `--srt` | Save as SRT subtitle file |
-| `--no-speakers` | Skip speaker name assignment |
-| `--reset-key` | Remove saved API key |
+| Key | Action |
+|-----|--------|
+| `Ctrl+K` | Open settings (change API key) |
+| `Ctrl+Q` | Quit |
+| `Tab` | Move between fields |
 
 ## API Key
 
@@ -95,19 +80,17 @@ Your Gemini API key is resolved in this order:
 1. `-k` flag
 2. `GEMINI_API_KEY` or `GOOGLE_API_KEY` environment variable
 3. Saved key (macOS Keychain / Windows AppData / Linux `~/.config/transcribe/key`)
-4. Interactive prompt (with option to save)
+4. Settings dialog on first launch
 
 Get a free API key at [aistudio.google.com](https://aistudio.google.com/apikey).
 
 ## How It Works
 
-1. Audio is analyzed with `ffprobe` for duration
-2. Files over 10 minutes are split into chunks with `ffmpeg`
-3. All chunks are uploaded to Gemini in parallel
-4. All chunks are transcribed in parallel (with rate limit retry)
-5. Timestamps are offset and merged into a single transcript
-6. Speakers are detected and you can assign names (with audio preview)
-7. Output is formatted as plain text, timestamped text, or SRT subtitles
+1. Select a model and enter an audio file path
+2. Click **Transcribe** — long files are automatically split and processed in parallel
+3. Assign real names to detected speakers (with audio preview)
+4. Choose output format: plain text, timestamped, or SRT subtitles
+5. Save your transcript
 
 ## License
 
