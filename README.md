@@ -10,9 +10,11 @@ Built with [Textual](https://textual.textualize.io/) for a proper GUI experience
 - **Speaker detection** — automatically identifies speakers and lets you assign real names
 - **Audio preview** — play a voice sample of each speaker to identify who's who
 - **Long audio support** — files over 10 minutes are split and transcribed in parallel
+- **Free & paid key support** — set your key tier in settings; paid keys get concurrent processing, free keys get smart rate-limit handling
+- **Rate limit awareness** — warns before transcription if your free-tier quota may be insufficient, tracks usage per session
 - **Multiple formats** — plain text, timestamped text, or SRT subtitles
 - **Verbatim transcription** — preserves filler words, pauses, laughter, and other sounds
-- **Settings dialog** — change your API key anytime with `Ctrl+K`
+- **Settings dialog** — change your API key and tier anytime with `Ctrl+K`
 - **Secure key storage** — macOS Keychain, Windows AppData, or Linux `~/.config`
 - **Cross-platform** — works on macOS, Linux, and Windows
 
@@ -87,10 +89,13 @@ Get a free API key at [aistudio.google.com](https://aistudio.google.com/apikey).
 ## How It Works
 
 1. Select a model and enter an audio file path
-2. Click **Transcribe** — long files are automatically split and processed in parallel
-3. Assign real names to detected speakers (with audio preview)
-4. Choose output format: plain text, timestamped, or SRT subtitles
-5. Save your transcript
+2. Open **Settings** (`Ctrl+K`) to set your API key and choose Free or Paid tier
+3. Click **Transcribe** — long files are automatically split into chunks
+   - **Paid keys**: chunks are transcribed concurrently (5 at a time) for speed
+   - **Free keys**: chunks are processed sequentially with rate-limit awareness
+4. Assign real names to detected speakers (with audio preview)
+5. Choose output format: plain text, timestamped, or SRT subtitles
+6. Save your transcript
 
 ## License
 
