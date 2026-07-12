@@ -38,7 +38,7 @@ powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 **2. Run:**
 
 ```bash
-git clone https://github.com/marcelwachter/transcribe.git
+git clone https://github.com/wachtermar/transcribe.git
 cd transcribe
 uv run transcribe.py
 ```
@@ -48,7 +48,7 @@ That's it — no `pip install`, no virtual env setup. `uv` handles everything au
 You can also run directly from GitHub without cloning:
 
 ```bash
-uv run https://raw.githubusercontent.com/marcelwachter/transcribe/main/transcribe.py
+uv run https://raw.githubusercontent.com/wachtermar/transcribe/main/transcribe.py
 ```
 
 ## Usage
