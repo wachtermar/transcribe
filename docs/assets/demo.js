@@ -64,7 +64,7 @@ function runPreflight() {
     : severity === "warn"
       ? `${chunks} bounded chunks fit inside the entered local guard. Free-key work remains sequential and provider capacity is still not observable here.`
       : tier === "paid"
-        ? `${chunks} bounded chunks can use up to ${concurrency} concurrent transcription workers after upload.`
+        ? `${chunks} bounded chunk${chunks === 1 ? "" : "s"} can use up to ${concurrency} concurrent transcription worker${concurrency === 1 ? "" : "s"} after upload.`
         : "A single bounded chunk can proceed without a long-audio quota warning.";
   byId("result-message").textContent = message;
 
