@@ -26,6 +26,7 @@ import sys
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 
 # ── Dependency Check ──────────────────────────────────────────────────
@@ -43,7 +44,7 @@ try:
     from textual.containers import Container, Horizontal, VerticalScroll
     from textual.screen import ModalScreen
     from textual.widgets import (
-        Button, Footer, Header, Input, Label,
+        Button, Footer, Header, Input,
         ProgressBar, RadioButton, RadioSet, Static, TextArea,
     )
 except ImportError:
@@ -72,12 +73,14 @@ VERSION = "0.4.0"
 MAX_CHUNK_S = 10 * 60
 
 MODELS = [
-    ("gemini-3-flash-preview", "Gemini 3 Flash  (recommended)"),
-    ("gemini-2.5-flash-preview-04-17", "Gemini 2.5 Flash  (stable)"),
+    ("gemini-3-flash-preview", "Gemini 3 Flash  (preview)"),
+    ("gemini-2.5-flash", "Gemini 2.5 Flash  (stable)"),
 ]
 
-# Free-tier rate limits (from actual API error responses)
-FREE_TIER_RPD = 20  # requests per day per model, confirmed from quota errors
+# Conservative process-local guard for free-key sessions. This is not a
+# provider quota reading: Gemini limits vary by project, model, and tier, and
+# the app cannot observe calls made by other processes.
+FREE_KEY_SESSION_GUARD = 20
 
 # ── Local request counter (session-level quota tracking) ─────────────
 _requests_used = 0
@@ -87,8 +90,8 @@ def get_requests_used():
     return _requests_used
 
 
-def remaining_quota():
-    return max(0, FREE_TIER_RPD - _requests_used)
+def remaining_session_budget():
+    return max(0, FREE_KEY_SESSION_GUARD - _requests_used)
 
 
 class DailyQuotaExhausted(Exception):
@@ -96,25 +99,31 @@ class DailyQuotaExhausted(Exception):
     pass
 
 
+@dataclass(frozen=True)
+class ChunkError:
+    """A failed chunk phase kept separate from successful transcript text."""
+
+    index: int
+    phase: str
+    message: str
+
+
 def estimate_rate_limit_impact(duration_s):
-    """Estimate whether free-tier rate limits will cause problems.
+    """Apply the conservative process-local request guard for a free key.
 
     Returns (num_chunks, severity) where severity is:
-      "ok"       — single chunk, should work fine
-      "warn"     — multiple chunks, warn about free-tier limits
-      "blocked"  — exceeds remaining daily quota, will fail with free key
+      "ok"       — one chunk fits inside the local session budget
+      "warn"     — multiple chunks fit, but provider capacity is not observable
+      "blocked"  — the required calls exceed the local session budget
     """
-    if duration_s <= MAX_CHUNK_S:
-        return 1, "ok"
-
-    num_chunks = math.ceil(duration_s / MAX_CHUNK_S)
-    left = remaining_quota()
+    num_chunks = max(1, math.ceil(duration_s / MAX_CHUNK_S))
+    left = remaining_session_budget()
 
     if num_chunks > left:
         return num_chunks, "blocked"
-    else:
-        # Any multi-chunk file risks hitting the 20 RPD free-tier limit
+    if num_chunks > 1:
         return num_chunks, "warn"
+    return num_chunks, "ok"
 
 
 # ── Audio helpers ────────────────────────────────────────────────────
@@ -456,7 +465,13 @@ def _parse_retry_delay(error_str):
 def _is_daily_quota_error(error_str):
     """Check if the error is a daily quota exhaustion (not retryable)."""
     s = error_str.lower()
-    return "perday" in s or "per_day" in s or "freetier" in s or "free_tier" in s
+    return (
+        "perday" in s
+        or "per_day" in s
+        or "per day" in s
+        or "requests per day" in s
+        or "rpd" in s
+    )
 
 
 def gemini_transcribe(client, model, uploaded_file, part_ctx="", on_retry=None):
@@ -509,7 +524,11 @@ Rules:
                 else:
                     wait = (2 ** attempt) * 5
                 wait = min(wait, 120)
-                is_rate_limit = "429" in err_lower or "resource_exhausted" in err_lower or "rate" in err_lower
+                is_rate_limit = (
+                    "429" in err_lower
+                    or "resource_exhausted" in err_lower
+                    or "rate" in err_lower
+                )
                 if on_retry:
                     on_retry(attempt + 1, max_retries, wait, is_rate_limit)
                 time.sleep(wait)
@@ -550,12 +569,20 @@ def do_transcribe_single(client, model, filepath, on_status=None, on_retry=None)
 MAX_CONCURRENT_TRANSCRIBE = 5
 
 
-def do_transcribe_chunked(client, model, chunk_paths, on_upload=None, on_transcribe=None, on_retry=None, sequential=False):
+def do_transcribe_chunked(
+    client,
+    model,
+    chunk_paths,
+    on_upload=None,
+    on_transcribe=None,
+    on_retry=None,
+    sequential=False,
+):
     n = len(chunk_paths)
 
     # Phase 1: Upload all files (parallel is fine — uploads don't count against generate quota)
     uploaded = [None] * n
-    upload_errors = []
+    errors = []
     upload_done = [0]
 
     with ThreadPoolExecutor(max_workers=n) as pool:
@@ -568,7 +595,7 @@ def do_transcribe_chunked(client, model, chunk_paths, on_upload=None, on_transcr
             try:
                 uploaded[idx] = fut.result()
             except Exception as e:
-                upload_errors.append((idx, str(e)))
+                errors.append(ChunkError(idx, "upload", str(e)))
             upload_done[0] += 1
             if on_upload:
                 on_upload(upload_done[0], n)
@@ -577,7 +604,6 @@ def do_transcribe_chunked(client, model, chunk_paths, on_upload=None, on_transcr
 
     # Phase 2: Transcribe — concurrent for paid keys, sequential for free tier
     results = []
-    errors = []
     quota_exhausted = False
     done_count = [0]
 
@@ -590,7 +616,9 @@ def do_transcribe_chunked(client, model, chunk_paths, on_upload=None, on_transcr
         # Sequential mode for free-tier keys
         for step, (idx, ufile) in enumerate(ready):
             if quota_exhausted:
-                errors.append((idx, "Skipped — daily quota exhausted"))
+                errors.append(
+                    ChunkError(idx, "quota", "Skipped after provider quota exhaustion")
+                )
                 done_count[0] += 1
                 if on_transcribe:
                     on_transcribe(done_count[0], len(ready))
@@ -601,9 +629,9 @@ def do_transcribe_chunked(client, model, chunk_paths, on_upload=None, on_transcr
                 results.append((idx, text))
             except DailyQuotaExhausted as e:
                 quota_exhausted = True
-                errors.append((idx, str(e)))
+                errors.append(ChunkError(idx, "quota", str(e)))
             except Exception as e:
-                errors.append((idx, str(e)))
+                errors.append(ChunkError(idx, "transcription", str(e)))
 
             done_count[0] += 1
             if on_transcribe:
@@ -622,9 +650,9 @@ def do_transcribe_chunked(client, model, chunk_paths, on_upload=None, on_transcr
                     results.append((idx, text))
                 except DailyQuotaExhausted as e:
                     quota_exhausted = True
-                    errors.append((idx, str(e)))
+                    errors.append(ChunkError(idx, "quota", str(e)))
                 except Exception as e:
-                    errors.append((idx, str(e)))
+                    errors.append(ChunkError(idx, "transcription", str(e)))
 
                 done_count[0] += 1
                 if on_transcribe:
@@ -876,8 +904,14 @@ class SettingsScreen(ModalScreen):
                 id="key-input",
             )
             with RadioSet(id="key-tier"):
-                yield RadioButton("Free API key", value=not self._paid_key)
-                yield RadioButton("Paid API key  (faster, no daily limit)", value=self._paid_key)
+                yield RadioButton(
+                    "Free API key  (sequential + local session guard)",
+                    value=not self._paid_key,
+                )
+                yield RadioButton(
+                    "Paid API key  (up to 5 transcription workers)",
+                    value=self._paid_key,
+                )
             with Horizontal(classes="settings-buttons"):
                 yield Button("Save", id="save-key", variant="primary")
                 yield Button("Delete", id="delete-key", variant="error")
@@ -943,6 +977,7 @@ class TranscribeApp(App):
         self.selected_model = MODELS[0][0]
         self.raw_transcript = ""
         self.speaker_list: list[str] = []
+        self.run_errors: list[ChunkError] = []
         self.active_player = None
         self.selected_format = 0  # 0=text, 1=timestamps, 2=srt, 3=all
 
@@ -1028,9 +1063,9 @@ class TranscribeApp(App):
             self.api_key = self._initial_key
         else:
             self.api_key = (
-                load_api_key()
-                or os.environ.get("GEMINI_API_KEY", "")
+                os.environ.get("GEMINI_API_KEY", "")
                 or os.environ.get("GOOGLE_API_KEY", "")
+                or load_api_key()
             )
 
         # Show only setup
@@ -1155,33 +1190,42 @@ class TranscribeApp(App):
         self._hide_rate_limit_warning()
 
     def _update_rate_limit_warning(self) -> None:
-        """Show or hide the rate limit warning based on file size and key tier."""
+        """Show the process-local free-key guard before provider work."""
         warning = self.query_one("#rate-limit-warning", Static)
+        button = self.query_one("#transcribe-btn", Button)
         if not self.audio_duration or self.paid_key:
             self._hide_rate_limit_warning()
+            button.disabled = not bool(self.audio_path)
             return
 
         num_chunks, severity = estimate_rate_limit_impact(self.audio_duration)
 
         used = get_requests_used()
-        left = remaining_quota()
+        left = remaining_session_budget()
 
         if severity == "blocked":
             warning.update(
-                f"  ! This file needs {num_chunks} chunks but only {left}/{FREE_TIER_RPD}\n"
-                f"    free-tier requests remain today ({used} used this session).\n"
-                f"    Transcription will be incomplete. Use a paid key: ai.google.dev"
+                f"  ! Held before provider work: this file needs {num_chunks} model "
+                f"request{'s' if num_chunks != 1 else ''}.\n"
+                f"    The local free-key guard has {left}/{FREE_KEY_SESSION_GUARD} "
+                f"slots left ({used} used in this process).\n"
+                "    Provider capacity is not visible here. Check AI Studio or use "
+                "a billing-enabled project."
             )
             warning.display = True
+            button.disabled = True
         elif severity == "warn":
             warning.update(
-                f"  ! This file needs {num_chunks} chunks ({left}/{FREE_TIER_RPD}\n"
-                f"    free-tier requests remain, {used} used this session).\n"
-                f"    May fail or be incomplete. A paid key is recommended."
+                f"  ! This file needs {num_chunks} model requests. The local free-key "
+                f"guard has {left}/{FREE_KEY_SESSION_GUARD} slots left.\n"
+                "    Provider limits vary by project, model, and tier and are not "
+                "visible to this app."
             )
             warning.display = True
+            button.disabled = False
         else:
             self._hide_rate_limit_warning()
+            button.disabled = False
 
     def _hide_rate_limit_warning(self) -> None:
         warning = self.query_one("#rate-limit-warning", Static)
@@ -1191,6 +1235,17 @@ class TranscribeApp(App):
     # ── Transcription ────────────────────────────────────────────────
 
     def _start_transcription(self) -> None:
+        if not self.paid_key and self.audio_duration:
+            num_chunks, severity = estimate_rate_limit_impact(self.audio_duration)
+            if severity == "blocked":
+                self.notify(
+                    f"Held before provider work: {num_chunks} request"
+                    f"{'s' if num_chunks != 1 else ''} exceed the remaining "
+                    "local session guard.",
+                    severity="error",
+                    timeout=10,
+                )
+                return
         self._switch_to("processing")
         self.query_one("#status-label", Static).update("Starting...")
         for pid in ("split", "upload", "transcribe"):
@@ -1200,6 +1255,12 @@ class TranscribeApp(App):
 
     @work(thread=True, exclusive=True)
     def _run_transcription(self) -> None:
+        self._execute_transcription()
+
+    def _execute_transcription(self) -> None:
+        """Run one transcription synchronously inside the Textual worker."""
+        errors: list[ChunkError] = []
+        quota_hit = False
         try:
             client = genai.Client(api_key=self.api_key)
             filepath = self.audio_path
@@ -1224,7 +1285,11 @@ class TranscribeApp(App):
 
                     def on_retry(attempt, max_retries, wait, is_rate_limit):
                         if is_rate_limit:
-                            msg = f"Rate limited — waiting {int(wait)}s (retry {attempt}/{max_retries}). Free API keys have low limits."
+                            msg = (
+                                f"Rate limited — waiting {int(wait)}s "
+                                f"(retry {attempt}/{max_retries}). "
+                                "Free API keys have low limits."
+                            )
                         else:
                             msg = f"API error — retrying in {int(wait)}s ({attempt}/{max_retries})"
                         self.call_from_thread(self._set_status, msg)
@@ -1254,12 +1319,17 @@ class TranscribeApp(App):
                         used = get_requests_used()
                         self.call_from_thread(
                             self._set_progress, "transcribe", current, total,
-                            f"Transcribing  [{used}/{FREE_TIER_RPD} daily requests used]"
+                            f"Transcribing  [{used}/{FREE_KEY_SESSION_GUARD} "
+                            "local-session calls used]",
                         )
 
                     def on_retry(attempt, max_retries, wait, is_rate_limit):
                         if is_rate_limit:
-                            msg = f"Rate limited — waiting {int(wait)}s (retry {attempt}/{max_retries}). Free API keys have low limits."
+                            msg = (
+                                f"Rate limited — waiting {int(wait)}s "
+                                f"(retry {attempt}/{max_retries}). "
+                                "Free API keys have low limits."
+                            )
                         else:
                             msg = f"API error — retrying in {int(wait)}s ({attempt}/{max_retries})"
                         self.call_from_thread(self._set_status, msg)
@@ -1273,42 +1343,50 @@ class TranscribeApp(App):
                     )
 
                     if quota_hit:
-                        ok_count = n - len(errors)
-                        used = get_requests_used()
+                        failed_parts = {issue.index for issue in errors}
+                        ok_count = n - len(failed_parts)
                         self.call_from_thread(
                             self.notify,
-                            f"Daily quota exhausted ({used}/{FREE_TIER_RPD} used) — "
-                            f"only {ok_count}/{n} parts transcribed. "
-                            f"Use a paid API key for longer files.",
+                            "The provider reported quota exhaustion — "
+                            f"only {ok_count}/{n} parts were transcribed. "
+                            "Check project limits in AI Studio before retrying.",
                             severity="error",
                             timeout=15,
                         )
-                    elif errors:
-                        for idx, err in errors:
+                    if errors:
+                        for issue in errors:
                             self.call_from_thread(
                                 self.notify,
-                                f"Part {idx + 1} failed: {err[:120]}",
+                                f"Part {issue.index + 1} {issue.phase} failed: "
+                                f"{issue.message[:120]}",
                                 severity="error",
                                 timeout=10,
                             )
 
             self.raw_transcript = transcript
+            self.run_errors = errors
 
             if not transcript.strip():
+                detail = "; ".join(
+                    f"part {issue.index + 1} {issue.phase}: {issue.message[:80]}"
+                    for issue in errors
+                )
                 self.call_from_thread(
                     self._on_error,
-                    "All parts failed. Your free API key's daily quota "
-                    "is likely exhausted. Use a paid key or try again tomorrow.",
+                    "No transcript was produced. "
+                    + (detail or "The provider returned no transcript text."),
                 )
                 return
 
             self.speaker_list = find_speakers(transcript)
 
             if errors:
-                failed = [idx + 1 for idx, _ in errors]
+                missing = ", ".join(
+                    f"{issue.index + 1} ({issue.phase})" for issue in errors
+                )
                 self.call_from_thread(
                     self._set_status,
-                    f"Done (parts {', '.join(map(str, failed))} missing — quota limit)",
+                    f"Incomplete — missing parts: {missing}",
                 )
             else:
                 self.call_from_thread(self._set_status, "Transcription complete")
@@ -1356,7 +1434,12 @@ class TranscribeApp(App):
             controls = Horizontal(classes="speaker-controls")
             row.mount(controls)
             controls.mount(
-                Input(value="", placeholder=f"Name for {spk}...", id=f"name-{i}", classes="speaker-input")
+                Input(
+                    value="",
+                    placeholder=f"Name for {spk}...",
+                    id=f"name-{i}",
+                    classes="speaker-input",
+                )
             )
             controls.mount(
                 Button("Play", id=f"play-{i}", classes="play-btn")
@@ -1438,9 +1521,19 @@ class TranscribeApp(App):
         # Summary
         n = len(self.speaker_list) if self.speaker_list else 0
         m, s = int(self.audio_duration // 60), int(self.audio_duration % 60)
-        self.query_one("#summary", Static).update(
-            f"Done  ·  {n} speaker{'s' if n != 1 else ''}  ·  {m}m {s:02d}s audio"
-        )
+        if self.run_errors:
+            missing_count = len({issue.index for issue in self.run_errors})
+            summary = (
+                f"INCOMPLETE  ·  {missing_count} part"
+                f"{'s' if missing_count != 1 else ''} missing  ·  "
+                f"{n} speaker{'s' if n != 1 else ''}  ·  {m}m {s:02d}s audio"
+            )
+        else:
+            summary = (
+                f"Done  ·  {n} speaker{'s' if n != 1 else ''}  ·  "
+                f"{m}m {s:02d}s audio"
+            )
+        self.query_one("#summary", Static).update(summary)
 
         self._switch_to("result")
 
@@ -1517,6 +1610,7 @@ class TranscribeApp(App):
         self.audio_duration = 0.0
         self.raw_transcript = ""
         self.speaker_list = []
+        self.run_errors = []
         self.selected_format = 0
         self.query_one("#file-input", Input).value = ""
         self.query_one("#file-info", Static).update("")
@@ -1534,7 +1628,15 @@ def main():
         add_help=True,
     )
     ap.add_argument("audio", nargs="?", default=None, help="Audio file path")
-    ap.add_argument("-k", "--api-key", default=None, help="Gemini API key")
+    ap.add_argument(
+        "-k",
+        "--api-key",
+        default=None,
+        help=(
+            "Gemini API key for this process; prefer GEMINI_API_KEY because "
+            "command arguments may be visible in shell history or process lists"
+        ),
+    )
     ap.add_argument("--reset-key", action="store_true", help="Remove saved API key")
     args = ap.parse_args()
 
