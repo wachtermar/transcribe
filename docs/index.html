@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Interactive proof for Transcribe, a Textual terminal app for speaker-aware long-audio transcription.">
+  <meta name="theme-color" content="#070b10">
+  <title>Transcribe — terminal audio workbench</title>
+  <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/demo.css">
+  <script src="assets/demo.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-head">
+    <div class="shell">
+      <a class="brand" href="#top" aria-label="Transcribe home">
+        <svg viewBox="0 0 32 20" aria-hidden="true"><path d="M1 11h4l2-7 4 14 4-12 3 10 3-5h10" fill="none" stroke="#6ee7d2" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        transcribe<span class="cursor">_</span>
+      </a>
+      <nav class="site-nav" aria-label="Primary navigation">
+        <a href="#demo-video">video</a><a href="#sandbox">preflight</a><a href="#format">speaker output</a><a href="#workflow">workflow</a><a href="https://github.com/wachtermar/transcribe">source ↗</a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="main">
+    <section class="shell hero" id="top">
+      <div>
+        <p class="eyebrow">Terminal audio workbench · v0.4.0</p>
+        <h1>Long recordings, split without losing the thread.</h1>
+        <p class="lede">A Textual app that preflights long audio, keeps chunk timestamps aligned, returns speaker labels for review, and exports text or SRT from the terminal.</p>
+        <div class="actions">
+          <a class="button primary" href="#sandbox">Run the preflight</a>
+          <a class="button" href="https://github.com/wachtermar/transcribe">Inspect the source ↗</a>
+        </div>
+      </div>
+      <div class="terminal" aria-label="Transcribe terminal workflow preview">
+        <div class="terminal-bar"><span class="dot red"></span><span class="dot amber"></span><span class="dot green"></span><span class="terminal-title">transcribe · release-interview.m4a</span></div>
+        <div class="terminal-body">
+          <div class="term-head"><strong>TRANSCRIBE_</strong><span class="term-state">● preflight complete</span></div>
+          <div class="wave" aria-hidden="true">
+            <i style="--h:20%;--o:.35"></i><i style="--h:52%"></i><i style="--h:88%"></i><i style="--h:42%"></i><i style="--h:72%"></i><i style="--h:34%"></i><i style="--h:94%"></i><i style="--h:62%"></i><i style="--h:26%"></i><i style="--h:76%"></i><i style="--h:48%"></i><i style="--h:86%"></i><i style="--h:32%"></i><i style="--h:68%"></i><i style="--h:22%"></i><i style="--h:54%"></i><i style="--h:91%"></i><i style="--h:38%"></i><i style="--h:73%"></i><i style="--h:27%"></i><i style="--h:58%"></i><i style="--h:82%"></i><i style="--h:46%"></i><i style="--h:64%"></i><i style="--h:30%"></i><i style="--h:70%"></i><i style="--h:44%"></i><i style="--h:86%"></i>
+          </div>
+          <div class="term-label">recording</div>
+          <div class="term-row"><span>duration</span><code>25m 00s</code><em>3 bounded chunks</em></div>
+          <div class="term-label">pipeline</div>
+          <div class="term-row"><span>split</span><div class="progress"><span style="--w:100%"></span></div><em>3 / 3</em></div>
+          <div class="term-row"><span>upload</span><div class="progress"><span style="--w:100%"></span></div><em>3 / 3</em></div>
+          <div class="term-row"><span>transcribe</span><div class="progress"><span style="--w:66%"></span></div><em>2 / 3</em></div>
+          <p class="term-note">Free key · work stays sequential · remaining request pressure stays visible.</p>
+        </div>
+      </div>
+    </section>
+
+    <div class="proof-strip">
+      <div class="shell proof-grid">
+        <div class="proof"><b>10 min</b><span>maximum chunk boundary in current source</span></div>
+        <div class="proof"><b>3 phases</b><span>separate split, upload, and transcribe progress</span></div>
+        <div class="proof"><b>5 max</b><span>concurrent transcription workers for paid-key mode</span></div>
+        <div class="proof"><b>3 outputs</b><span>plain text, timestamps, or SRT subtitles</span></div>
+      </div>
+    </div>
+
+    <section class="section shell video-section" id="demo-video">
+      <div class="section-head">
+        <div><p class="eyebrow">00 / product demo</p><h2>From local guard to reviewed export in nine seconds.</h2></div>
+        <p class="section-intro">The recording exercises the same deterministic browser proof below: a local free-key guard, a paid-key concurrency preview, a speaker rename, and SRT output. Action callouts keep every transition explicit.</p>
+      </div>
+      <div class="video-frame">
+        <video controls playsinline preload="metadata" poster="assets/video-poster.png">
+          <source src="assets/transcribe-demo.mp4" type="video/mp4">
+          Your browser does not support the embedded demo video.
+        </video>
+      </div>
+      <p class="caption">DETERMINISTIC BROWSER PROOF · SANITIZED TEXT · NO AUDIO UPLOAD · NO MODEL REQUEST</p>
+    </section>
+
+    <section class="section shell" id="sandbox">
+      <div class="section-head">
+        <div><p class="eyebrow">01 / deterministic preflight</p><h2>See the stop condition before the model call.</h2></div>
+        <p class="section-intro">Change duration, entered session usage, or key tier. This sandbox mirrors the repository’s chunk and request-pressure rules without uploading audio or calling Gemini.</p>
+      </div>
+      <div class="sandbox">
+        <div class="controls">
+          <div class="field"><label for="duration">Recording duration · minutes</label><input id="duration" type="number" min="1" max="600" value="25"></div>
+          <div class="field"><label for="used">Free-tier requests used · this session</label><input id="used" type="number" min="0" max="20" value="4"></div>
+          <span class="group-label">Key tier</span>
+          <div class="tier"><button class="active" type="button" data-tier="free" aria-pressed="true">Free · sequential</button><button type="button" data-tier="paid" aria-pressed="false">Paid · concurrent</button></div>
+          <button class="button primary" id="run-preflight" type="button">Run deterministic preview</button>
+          <p class="boundary">BROWSER-ONLY PROOF · NO AUDIO UPLOAD · NO API KEY · NO MODEL REQUEST</p>
+        </div>
+        <div class="result" aria-live="polite">
+          <div class="status-line"><p class="eyebrow">preflight result</p><span class="status-badge" id="status-badge">Review quota</span></div>
+          <div class="metric"><div><b id="chunks">3</b><span>chunks</span></div><div><b id="remaining">16</b><span>local slots left</span></div><div><b id="concurrency">1</b><span>workers</span></div></div>
+          <div class="stages">
+            <div class="stage"><span>01 split</span><div class="bar"><i style="--w:100%"></i></div><output>ready</output></div>
+            <div class="stage"><span>02 upload</span><div class="bar"><i style="--w:100%"></i></div><output>ready</output></div>
+            <div class="stage"><span>03 transcribe</span><div class="bar"><i style="--w:100%"></i></div><output>ready</output></div>
+          </div>
+          <p class="result-message" id="result-message"></p>
+        </div>
+      </div>
+    </section>
+
+    <section class="section shell" id="format">
+      <div class="section-head">
+        <div><p class="eyebrow">02 / human review</p><h2>Speaker labels stay editable before export.</h2></div>
+        <p class="section-intro">Rename the sanitized demo speakers and switch output formats. The terminal app also exposes audio preview for speaker identification; this browser proof keeps the interaction silent and deterministic.</p>
+      </div>
+      <div class="rename-grid">
+        <div class="speaker-panel">
+          <span class="group-label">Detected speakers</span>
+          <label class="speaker"><span>Speaker 1</span><input id="speaker-one" value="Interviewer" aria-label="Name for Speaker 1"></label>
+          <label class="speaker"><span>Speaker 2</span><input id="speaker-two" value="Engineer" aria-label="Name for Speaker 2"></label>
+        </div>
+        <div class="output-panel">
+          <span class="group-label">Export preview</span>
+          <div class="format-tabs"><button type="button" data-format="plain" aria-pressed="false">Plain text</button><button class="active" type="button" data-format="timestamps" aria-pressed="true">Timestamps</button><button type="button" data-format="srt" aria-pressed="false">SRT</button></div>
+          <pre id="transcript-output" aria-live="polite"></pre>
+        </div>
+      </div>
+    </section>
+
+    <section class="section shell" id="workflow">
+      <div class="section-head">
+        <div><p class="eyebrow">03 / system path</p><h2>A visible pipeline, not a single spinner.</h2></div>
+        <p class="section-intro">The application separates preparation, provider work, and human review. Missing chunks are surfaced as errors instead of being embedded into a transcript as if they succeeded.</p>
+      </div>
+      <div class="workflow" role="img" aria-label="Transcribe workflow from selecting audio through export">
+        <div class="flow-step"><small>01</small><b>Select</b><p>Choose a local audio file and inspect duration.</p></div>
+        <div class="flow-step"><small>02</small><b>Preflight</b><p>Apply the process-local free-key request guard.</p></div>
+        <div class="flow-step"><small>03</small><b>Split</b><p>Bound long recordings into ten-minute parts.</p></div>
+        <div class="flow-step"><small>04</small><b>Upload</b><p>Track provider file readiness separately.</p></div>
+        <div class="flow-step"><small>05</small><b>Transcribe</b><p>Run sequentially or with bounded concurrency.</p></div>
+        <div class="flow-step"><small>06</small><b>Review</b><p>Preview and rename detected speakers.</p></div>
+        <div class="flow-step"><small>07</small><b>Export</b><p>Save text, timestamps, or SRT.</p></div>
+      </div>
+      <p class="failure-line">FAILURE PATH · provider quota exhaustion stops remaining free-key work; upload and transcription failures keep their part and phase visible.</p>
+    </section>
+
+    <section class="section shell" id="interface">
+      <div class="section-head">
+        <div><p class="eyebrow">04 / source-rendered interface</p><h2>The terminal app is the product.</h2></div>
+        <p class="section-intro">This is the current Textual result screen rendered from public source with a sanitized 24-second transcript. The text demonstrates interface behavior; it is not presented as a completed Gemini transcription.</p>
+      </div>
+      <a class="interface-link" href="assets/textual-result.png" target="_blank" rel="noreferrer" aria-label="Open the full-size Textual result screen in a new tab">
+        <span>Open full-size interface ↗</span>
+        <div class="interface-frame"><img src="assets/textual-result.png" alt="Transcribe Textual result screen with output choices, sanitized speaker transcript, save path, and completion summary" width="1482" height="1075"></div>
+      </a>
+      <div class="mobile-details" aria-label="Mobile-readable Textual interface details">
+        <figure><figcaption>Output and transcript · scroll horizontally</figcaption><div class="detail-scroll"><img class="detail-output" src="assets/textual-detail-output.png" alt="Full-size crop of the Textual output formats and sanitized transcript" width="1100" height="620"></div></figure>
+        <figure><figcaption>Save and completion state · scroll horizontally</figcaption><div class="detail-scroll"><img class="detail-completion" src="assets/textual-detail-completion.png" alt="Full-size crop of the Textual save controls and completion summary" width="1400" height="360"></div></figure>
+      </div>
+      <p class="caption">SANITIZED DEMO DATA · CURRENT PUBLIC TEXTUAL UI · NO CLAIM OF MODEL ACCURACY OR CUSTOMER USE</p>
+      <div class="limits">
+        <div class="limit"><b>Local prerequisites</b><p>Python 3.10+, uv, ffmpeg, and ffprobe are required to run the terminal app.</p></div>
+        <div class="limit"><b>Provider boundary</b><p>The application uses a user-supplied Gemini API key. The local guard cannot read project-level provider usage; limits and output quality are not guaranteed here.</p></div>
+        <div class="limit"><b>Demo boundary</b><p>This page tests deterministic planning and formatting only. It does not accept files or send requests.</p></div>
+      </div>
+    </section>
+  </main>
+
+  <footer><div class="shell foot"><span>transcribe_ · terminal audio workbench</span><span>Source and setup: github.com/wachtermar/transcribe</span></div></footer>
+</body>
+</html>

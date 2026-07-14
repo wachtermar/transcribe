@@ -1,41 +1,35 @@
+<p align="center">
+  <img src="docs/assets/hero.png" alt="Transcribe terminal audio workbench showing a long-recording workflow with split, upload, and transcribe progress" width="1200">
+</p>
+
 # Transcribe
 
-A terminal GUI app that transcribes audio files with speaker detection using Google Gemini.
+A Textual terminal app for speaker-aware audio transcription with visible long-audio handling, a process-local free-key guard, and text or SRT export.
 
-Built with [Textual](https://textual.textualize.io/) for a proper GUI experience right in your terminal.
+[Try the deterministic demo](https://wachtermar.github.io/transcribe/) · [Watch the nine-second walkthrough](https://wachtermar.github.io/transcribe/assets/transcribe-demo.mp4) · [Inspect the workflow](#how-it-works) · [Run locally](#quick-start)
 
-## Features
+## What it proves
 
-- **Terminal GUI** — real buttons, inputs, progress bars, and radio selectors — not just a CLI
-- **Speaker detection** — automatically identifies speakers and lets you assign real names
-- **Audio preview** — play a voice sample of each speaker to identify who's who
-- **Long audio support** — files over 10 minutes are split and transcribed in parallel
-- **Free & paid key support** — set your key tier in settings; paid keys get concurrent processing, free keys get smart rate-limit handling
-- **Rate limit awareness** — warns before transcription if your free-tier quota may be insufficient, tracks usage per session
-- **Multiple formats** — plain text, timestamped text, or SRT subtitles
-- **Verbatim transcription** — preserves filler words, pauses, laughter, and other sounds
-- **Settings dialog** — change your API key and tier anytime with `Ctrl+K`
-- **Secure key storage** — macOS Keychain, Windows AppData, or Linux `~/.config`
-- **Cross-platform** — works on macOS, Linux, and Windows
+- A terminal interface with buttons, inputs, progress bars, settings, and keyboard navigation.
+- Long recordings are split at ten-minute boundaries before provider work.
+- Free-key mode runs chunks sequentially and applies a conservative process-local request guard before provider work; paid-key mode allows up to five concurrent transcription workers.
+- Detected speaker labels can be previewed and renamed before export.
+- Output can be saved as plain text, timestamped text, SRT, or all formats.
+- Partial chunk failures remain separate from the merged transcript.
 
-## Quick Start
+The [browser demo](https://wachtermar.github.io/transcribe/) is intentionally bounded: it mirrors deterministic preflight and output-formatting behavior with sanitized data. It does not upload audio, request an API key, or call Gemini.
 
-**1. Install prerequisites:**
+## Interface
 
-```bash
-# macOS
-brew install ffmpeg uv
+<p align="center">
+  <img src="docs/assets/textual-result.png" alt="Current Transcribe Textual result screen with sanitized speaker-aware transcript" width="1000">
+</p>
 
-# Linux
-sudo apt install ffmpeg
-curl -LsSf https://astral.sh/uv/install.sh | sh
+The screenshot is rendered from the current public Textual source with a sanitized 24-second demo transcript. It demonstrates interface behavior, not model accuracy or customer use.
 
-# Windows
-winget install ffmpeg
-powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
-```
+## Quick start
 
-**2. Run:**
+Requirements: Python 3.10+, [uv](https://docs.astral.sh/uv/), `ffmpeg`, and `ffprobe`.
 
 ```bash
 git clone https://github.com/wachtermar/transcribe.git
@@ -43,59 +37,68 @@ cd transcribe
 uv run transcribe.py
 ```
 
-That's it — no `pip install`, no virtual env setup. `uv` handles everything automatically.
-
-You can also run directly from GitHub without cloning:
+Or run the public script directly:
 
 ```bash
 uv run https://raw.githubusercontent.com/wachtermar/transcribe/main/transcribe.py
 ```
 
-## Usage
+Common commands:
 
 ```bash
-# Launch the GUI
-uv run transcribe.py
-
-# Pre-load an audio file
-uv run transcribe.py recording.mp3
-
-# Pre-set API key
-uv run transcribe.py -k YOUR_KEY
-
-# Remove saved API key
-uv run transcribe.py --reset-key
+uv run transcribe.py recording.mp3  # pre-load a file
+GEMINI_API_KEY=YOUR_KEY uv run transcribe.py  # preferred one-process override
+uv run transcribe.py --reset-key     # remove the saved key
 ```
 
-## Keyboard Shortcuts
+API keys resolve from the `-k` flag, `GEMINI_API_KEY` or `GOOGLE_API_KEY`, saved platform storage, then the first-run settings dialog. Saved keys use macOS Keychain, Windows AppData, or a permission-restricted Linux config file. Prefer an environment variable or saved platform storage: command-line `-k` values can be exposed through shell history or process listings.
+
+## How it works
+
+```text
+local audio
+    │
+    ▼
+duration + process-local request guard
+    │
+    ├── hold before provider work when the local free-key budget is insufficient
+    │
+    ▼
+≤10-minute chunks → upload readiness → transcription
+                                      │
+                                      ├── free key: sequential
+                                      └── paid key: ≤5 concurrent workers
+    │
+    ▼
+timestamp merge → speaker preview + rename → text / timestamps / SRT
+```
+
+The app exposes split, upload, and transcription as separate progress phases. When a part fails, the error is retained separately and only successful results are merged.
+
+## Keyboard shortcuts
 
 | Key | Action |
-|-----|--------|
-| `Ctrl+K` | Open settings (change API key) |
+| --- | --- |
+| `Ctrl+K` | Open key and tier settings |
 | `Ctrl+Q` | Quit |
-| `Tab` | Move between fields |
+| `Tab` | Move between controls |
 
-## API Key
+## Verification
 
-Your Gemini API key is resolved in this order:
+```bash
+uv run python -m py_compile transcribe.py
+uv run python -m unittest discover -s tests -v
+uvx ruff check transcribe.py tests
+```
 
-1. `-k` flag
-2. `GEMINI_API_KEY` or `GOOGLE_API_KEY` environment variable
-3. Saved key (macOS Keychain / Windows AppData / Linux `~/.config/transcribe/key`)
-4. Settings dialog on first launch
+The tests cover deterministic chunk preflight, timestamp offsets, speaker ordering, and SRT conversion. They do not call Gemini.
 
-Get a free API key at [aistudio.google.com](https://aistudio.google.com/apikey).
+## Boundaries
 
-## How It Works
-
-1. Select a model and enter an audio file path
-2. Open **Settings** (`Ctrl+K`) to set your API key and choose Free or Paid tier
-3. Click **Transcribe** — long files are automatically split into chunks
-   - **Paid keys**: chunks are transcribed concurrently (5 at a time) for speed
-   - **Free keys**: chunks are processed sequentially with rate-limit awareness
-4. Assign real names to detected speakers (with audio preview)
-5. Choose output format: plain text, timestamped, or SRT subtitles
-6. Save your transcript
+- Transcription requires a user-supplied Gemini API key and sends selected audio to that provider.
+- The 20-call free-key guard counts successful calls in the current process only. It is not a provider quota reading and cannot see project activity from other sessions.
+- Rate limits and model quality are provider behavior; this repository does not promise availability, accuracy, or a fixed quota.
+- The app is an inspectable public utility, not evidence of customer deployments or production scale.
 
 ## License
 
